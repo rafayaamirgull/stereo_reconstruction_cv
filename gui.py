@@ -4,6 +4,24 @@ import os
 import numpy as np
 import cv2
 import glob
+from io import StringIO
+
+# Custom output redirection class
+class RedirectText:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+        self.output = StringIO()
+
+    def write(self, string):
+        self.output.write(string)
+        self.text_widget.insert(tk.END, string)
+        self.text_widget.see(tk.END)
+
+    def flush(self):
+        pass
+
+    def get_output(self):
+        return self.output.getvalue()
 
 # Camera Calibration Function (unchanged)
 def cam_calib(base_path):
@@ -70,7 +88,7 @@ def draw_epilines(img1, img2, lines, pts1, pts2):
         img2 = cv2.circle(img2, tuple(pt2), 5, color, -1)
     return img1, img2
 
-# Updated Stereo Rectification Function
+# Updated Stereo Rectification Function (unchanged)
 def stereo_rect(stereo_path, baseline=0.1, cameraMatrix=None):
     if cameraMatrix is None:
         cameraMatrix = np.array([[1000, 0, 1920/2], [0, 1000, 1080/2], [0, 0, 1]])  # Default if not provided
@@ -190,25 +208,115 @@ def stereo_rect(stereo_path, baseline=0.1, cameraMatrix=None):
         "Rectified Right": imgR_after_rec
     }
 
+def feat_detect_match(stereo_path, contrast_threshold=0.04):
+    sift = cv2.SIFT_create(contrastThreshold=contrast_threshold)
+
+    left_image = glob.glob(f"{stereo_path}/img1.jpg")
+    right_image = glob.glob(f"{stereo_path}/img2.jpg")
+
+    if not left_image or not right_image:
+        return "Error: Missing img1.jpg or img2.jpg in the folder."
+
+    imgL = cv2.imread(left_image[0], cv2.IMREAD_GRAYSCALE)
+    imgR = cv2.imread(right_image[0], cv2.IMREAD_GRAYSCALE)
+
+    if imgL is None or imgR is None:
+        return "Error: Failed to load one or both images."
+
+    keypoints_left, descriptors_left = sift.detectAndCompute(imgL, None)
+    keypoints_right, descriptors_right = sift.detectAndCompute(imgR, None)
+    print(f"SIFT: {len(keypoints_left)} keypoints detected in left image.")
+    print(f"SIFT: {len(keypoints_right)} keypoints detected in right image.")
+    
+    # FLANN parameters
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+
+    # Use FLANN-based matcher to find correspondences
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    matches = flann.knnMatch(descriptors_left, descriptors_right, k=2)
+    
+    # Filter matches using the Lowe's ratio test
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    print(f"FLANN Matcher: {len(matches)} matches found, {len(good_matches)} after ratio test.")
+    
+    imgL_with_kp = cv2.drawKeypoints(imgL, keypoints_left, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    imgR_with_kp = cv2.drawKeypoints(imgR, keypoints_right, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    
+    img_matches = cv2.drawMatchesKnn(imgL, keypoints_left, imgR, keypoints_right, matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    img_good_matches = cv2.drawMatches(imgL, keypoints_left, imgR, keypoints_right, good_matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    
+    # Resize images for display
+    imgL_with_kp = cv2.resize(imgL_with_kp, (640, 360))
+    imgR_with_kp = cv2.resize(imgR_with_kp, (640, 360))
+    img_matches = cv2.resize(img_matches, (1280, 360))  # Wider image for matches
+    img_good_matches = cv2.resize(img_good_matches, (1280, 360))  # Wider image for matches
+
+    return {
+        "Left Image with Keypoints": imgL_with_kp,
+        "Right Image with Keypoints": imgR_with_kp,
+        "Matched Images Before Lowe's Ratio": img_matches,
+        "Matched Images After Lowe's Ratio": img_good_matches
+    }
+
 # Main GUI class
 class NotebookGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Notebook Interface")
-        self.root.geometry("1300x700")  # Adjusted size to fit resized images and controls
+        self.root.geometry("1400x900")  # Adjusted size for layout
 
-        # Create tabbed interface
-        self.notebook = ttk.Notebook(self.root)
+        # Create a main frame to hold the canvas and scrollbar
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill="both", expand=True)
+
+        # Create a canvas
+        self.canvas = tk.Canvas(self.main_frame)
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        # Add a vertical scrollbar to the canvas
+        self.scrollbar = ttk.Scrollbar(self.main_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollbar.pack(side="right", fill="y")
+
+        # Configure the canvas to use the scrollbar
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        # Create a frame inside the canvas to hold the notebook
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+
+        # Bind the canvas to update scroll region when the frame size changes
+        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+        # Enable mouse wheel scrolling
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)  # Windows
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)  # Linux (scroll up)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)  # Linux (scroll down)
+
+        # Create tabbed interface inside the scrollable frame
+        self.notebook = ttk.Notebook(self.scrollable_frame)
         self.notebook.pack(pady=10, expand=True, fill="both")
 
         self.cam_calib_results = None
         self.stereo_rect_results = None
+        self.feat_detect_match_results = None
 
         # Tab 1: Camera Calibration
         self.create_cam_calib_tab()
 
         # Tab 2: Stereo Rectification
         self.create_stereo_rect_tab()
+
+        # Tab 3: Feature Detection and Matching
+        self.create_feat_detect_match_tab()
+
+    def _on_mousewheel(self, event):
+        # Handle mouse wheel scrolling
+        if event.num == 5 or event.delta < 0:  # Scroll down
+            self.canvas.yview_scroll(1, "units")
+        elif event.num == 4 or event.delta > 0:  # Scroll up
+            self.canvas.yview_scroll(-1, "units")
 
     def create_cam_calib_tab(self):
         tab1 = ttk.Frame(self.notebook)
@@ -261,7 +369,7 @@ class NotebookGUI:
         browse_btn = ttk.Button(controls_frame, text="Browse", command=self.stereo_rect_browse_folder)
         browse_btn.grid(row=0, column=2, padx=5, pady=5)
 
-        ttk.Label(controls_frame, text="Baseline (meters):").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        ttk.Label(controls_frame, text="Baseline (millimeters):").grid(row=1, column=0, padx=5, pady=5, sticky="e")
         self.baseline_entry = ttk.Entry(controls_frame, width=10)
         self.baseline_entry.grid(row=1, column=1, padx=5, pady=5)
         self.baseline_entry.insert(0, "0.1")  # Default value
@@ -270,20 +378,20 @@ class NotebookGUI:
         run_btn.grid(row=2, column=1, pady=10)
 
         # Image display labels
-        self.img_labels = {
+        self.stereo_img_labels = {
             "Original Left": tk.Label(tab2),
             "Original Right": tk.Label(tab2),
             "Rectified Left": tk.Label(tab2),
             "Rectified Right": tk.Label(tab2)
         }
-        for i, (title, label) in enumerate(self.img_labels.items()):
+        for i, (title, label) in enumerate(self.stereo_img_labels.items()):
             ttk.Label(tab2, text=title).grid(row=3 + 2 * (i // 2), column=i % 2, pady=(0, 2), sticky="n")
             label.grid(row=4 + 2 * (i // 2), column=i % 2, padx=5, pady=5)
 
     def run_stereo_rect(self):
         folder_path = self.stereo_rect_path_entry.get()
         if not folder_path:
-            for label in self.img_labels.values():
+            for label in self.stereo_img_labels.values():
                 label.config(image='')
                 tk.Label(label.master, text="Please provide a folder path.").grid(row=7, column=0, columnspan=2)
             return
@@ -301,7 +409,7 @@ class NotebookGUI:
         self.stereo_rect_results = stereo_rect(folder_path, baseline=baseline, cameraMatrix=self.cam_calib_results[0][1] if self.cam_calib_results else None)
         
         if isinstance(self.stereo_rect_results, str):  # Error case
-            for label in self.img_labels.values():
+            for label in self.stereo_img_labels.values():
                 label.config(image='')
                 tk.Label(label.master, text=self.stereo_rect_results).grid(row=7, column=0, columnspan=2)
             return
@@ -310,8 +418,110 @@ class NotebookGUI:
         for title, img in self.stereo_rect_results.items():
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img_pil = tk.PhotoImage(data=cv2.imencode('.png', img_rgb)[1].tobytes())
-            self.img_labels[title].config(image=img_pil)
-            self.img_labels[title].image = img_pil  # Keep a reference to avoid garbage collection
+            self.stereo_img_labels[title].config(image=img_pil)
+            self.stereo_img_labels[title].image = img_pil  # Keep a reference to avoid garbage collection
+
+    def stereo_rect_browse_folder(self):
+        folder = filedialog.askdirectory(title="Select Folder with Stereo Image Pairs")
+        if folder:
+            self.stereo_rect_path_entry.delete(0, tk.END)
+            self.stereo_rect_path_entry.insert(0, folder)
+
+    def create_feat_detect_match_tab(self):
+        tab3 = ttk.Frame(self.notebook)
+        self.notebook.add(tab3, text="Feature Detection and Matching")
+
+        # Controls frame
+        controls_frame = ttk.Frame(tab3)
+        controls_frame.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+
+        ttk.Label(controls_frame, text="Image Pair Folder Path:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.feat_detect_match_path_entry = ttk.Entry(controls_frame, width=50)
+        self.feat_detect_match_path_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        browse_btn = ttk.Button(controls_frame, text="Browse", command=self.feat_detect_match_browse_folder)
+        browse_btn.grid(row=0, column=2, padx=5, pady=5)
+
+        ttk.Label(controls_frame, text="SIFT Contrast Threshold:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.contrast_threshold_entry = ttk.Entry(controls_frame, width=10)
+        self.contrast_threshold_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.contrast_threshold_entry.insert(0, "0.04")  # Default value
+
+        run_btn = ttk.Button(controls_frame, text="Run", command=self.run_feat_detect_match)
+        run_btn.grid(row=2, column=1, pady=10)
+
+        # Image display labels
+        self.feat_img_labels = {
+            "Left Image with Keypoints": tk.Label(tab3),
+            "Right Image with Keypoints": tk.Label(tab3),
+            "Matched Images Before Lowe's Ratio": tk.Label(tab3),
+            "Matched Images After Lowe's Ratio": tk.Label(tab3)
+        }
+
+        # First two images side by side
+        for i, title in enumerate(["Left Image with Keypoints", "Right Image with Keypoints"]):
+            ttk.Label(tab3, text=title).grid(row=3, column=i, pady=(0, 2), sticky="n")
+            self.feat_img_labels[title].grid(row=4, column=i, padx=5, pady=5)
+
+        # Last two images stacked vertically below, spanning both columns
+        ttk.Label(tab3, text="Matched Images Before Lowe's Ratio").grid(row=5, column=0, columnspan=2, pady=(0, 2), sticky="n")
+        self.feat_img_labels["Matched Images Before Lowe's Ratio"].grid(row=6, column=0, columnspan=2, padx=5, pady=5)
+
+        ttk.Label(tab3, text="Matched Images After Lowe's Ratio").grid(row=7, column=0, columnspan=2, pady=(0, 2), sticky="n")
+        self.feat_img_labels["Matched Images After Lowe's Ratio"].grid(row=8, column=0, columnspan=2, padx=5, pady=5)
+
+        # Output text for debug/info
+        self.feat_detect_match_output_text = scrolledtext.ScrolledText(tab3, width=70, height=5, wrap=tk.WORD)
+        self.feat_detect_match_output_text.grid(row=9, column=0, columnspan=2, padx=10, pady=5)
+
+    def run_feat_detect_match(self):
+        folder_path = self.feat_detect_match_path_entry.get()
+        if not folder_path:
+            for label in self.feat_img_labels.values():
+                label.config(image='')
+            self.feat_detect_match_output_text.delete(1.0, tk.END)
+            self.feat_detect_match_output_text.insert(tk.END, "Please provide a folder path.\n")
+            return
+        
+        # Get and validate contrast threshold input
+        contrast_threshold_str = self.contrast_threshold_entry.get().strip()
+        try:
+            contrast_threshold = float(contrast_threshold_str)
+            if contrast_threshold < 0 or contrast_threshold > 0.1:  # Reasonable range for contrast threshold
+                raise ValueError("Contrast threshold must be between 0 and 0.1.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", f"Invalid contrast threshold: {e}. Using default (0.04).")
+            contrast_threshold = 0.04
+
+        # Redirect print output to textbox
+        redirect = RedirectText(self.feat_detect_match_output_text)
+        import sys
+        sys.stdout = redirect
+
+        self.feat_detect_match_results = feat_detect_match(folder_path, contrast_threshold=contrast_threshold)
+        
+        if isinstance(self.feat_detect_match_results, str):  # Error case
+            for label in self.feat_img_labels.values():
+                label.config(image='')
+            self.feat_detect_match_output_text.delete(1.0, tk.END)
+            self.feat_detect_match_output_text.insert(tk.END, self.feat_detect_match_results + "\n")
+            return
+
+        # Restore stdout
+        sys.stdout = sys.__stdout__
+
+        # Display images
+        for title, img in self.feat_detect_match_results.items():
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_pil = tk.PhotoImage(data=cv2.imencode('.png', img_rgb)[1].tobytes())
+            self.feat_img_labels[title].config(image=img_pil)
+            self.feat_img_labels[title].image = img_pil  # Keep a reference to avoid garbage collection
+
+    def feat_detect_match_browse_folder(self):
+        folder = filedialog.askdirectory(title="Select Folder with Image Pair")
+        if folder:
+            self.feat_detect_match_path_entry.delete(0, tk.END)
+            self.feat_detect_match_path_entry.insert(0, folder)
 
     def stereo_rect_browse_folder(self):
         folder = filedialog.askdirectory(title="Select Folder with Stereo Image Pairs")
