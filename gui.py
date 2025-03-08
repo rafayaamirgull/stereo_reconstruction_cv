@@ -23,7 +23,7 @@ class RedirectText:
     def get_output(self):
         return self.output.getvalue()
 
-# Camera Calibration Function (unchanged)
+# Camera Calibration Function
 def cam_calib(base_path):
     checkerboardsize = (9, 7)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
@@ -74,7 +74,7 @@ def cam_calib(base_path):
 
     return [("Camera Matrix", cameraMatrix), ("Distortion Parameters", dist), ("Reprojection Error", reprojection_error)]
 
-# Draw Epipolar Lines Function (unchanged)
+# Draw Epipolar Lines Function
 def draw_epilines(img1, img2, lines, pts1, pts2):
     r, c = img1.shape
     img1 = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
@@ -88,7 +88,7 @@ def draw_epilines(img1, img2, lines, pts1, pts2):
         img2 = cv2.circle(img2, tuple(pt2), 5, color, -1)
     return img1, img2
 
-# Updated Stereo Rectification Function (unchanged)
+# Stereo Rectification Function
 def stereo_rect(stereo_path, baseline=0.1, cameraMatrix=None):
     if cameraMatrix is None:
         cameraMatrix = np.array([[1000, 0, 1920/2], [0, 1000, 1080/2], [0, 0, 1]])  # Default if not provided
@@ -260,6 +260,67 @@ def feat_detect_match(stereo_path, contrast_threshold=0.04):
         "Matched Images After Lowe's Ratio": img_good_matches
     }
 
+def stereo_geometry_estimation(stereo_path, baseline=0.1, cameraMatrix=None):
+    if cameraMatrix is None:
+        cameraMatrix = np.array([[1000, 0, 1920/2], [0, 1000, 1080/2], [0, 0, 1]])  # Default if not provided
+
+    left_image = glob.glob(f"{stereo_path}/img1.jpg")
+    right_image = glob.glob(f"{stereo_path}/img2.jpg")
+
+    if not left_image or not right_image:
+        return "Error: Missing img1.jpg or img2.jpg in the folder."
+
+    imgL = cv2.imread(left_image[0], cv2.IMREAD_GRAYSCALE)
+    imgR = cv2.imread(right_image[0], cv2.IMREAD_GRAYSCALE)
+
+    K0 = np.array(cameraMatrix)
+    K1 = np.array(cameraMatrix)
+    R = np.eye(3)  # Identity matrix (no rotation)
+    T = np.array([[baseline], [0], [0]])
+    image_size = (int(3840), int(2160))
+
+    # Use SIFT for feature detection and matching
+    sift = cv2.SIFT_create()
+    keypoints_left, descriptors_left = sift.detectAndCompute(imgL, None)
+    keypoints_right, descriptors_right = sift.detectAndCompute(imgR, None)
+    
+    # FLANN parameters
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+
+    # Use FLANN-based matcher to find correspondences
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    matches = flann.knnMatch(descriptors_left, descriptors_right, k=2)
+    
+    # Filter matches using the Lowe's ratio test
+    pts_left = []
+    pts_right = []
+    for i, (m, n) in enumerate(matches):
+        if m.distance < 0.7 * n.distance:
+            pts_left.append(keypoints_left[m.queryIdx].pt)
+            pts_right.append(keypoints_right[m.trainIdx].pt)
+
+    pts_left = np.int32(pts_left)
+    pts_right = np.int32(pts_right)
+    F, mask = cv2.findFundamentalMat(pts_left, pts_right, cv2.FM_LMEDS)
+
+    # Select only inlier points
+    pts_left = pts_left[mask.ravel() == 1]
+    pts_right = pts_right[mask.ravel() == 1]
+
+    # Compute the Essential Matrix
+    E, mask = cv2.findEssentialMat(pts_left, pts_right, K0, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+    
+    # Decompose the Essential Matrix to recover R and T
+    _, R, T, _ = cv2.recoverPose(E, pts_left, pts_right, K0)
+
+    return {
+        "Essential Matrix": E,
+        "Rotation Matrix": R,
+        "Translation Vector": T
+    }
+
 # Main GUI class
 class NotebookGUI:
     def __init__(self, root):
@@ -301,6 +362,7 @@ class NotebookGUI:
         self.cam_calib_results = None
         self.stereo_rect_results = None
         self.feat_detect_match_results = None
+        self.stereo_geometry_results = None  # Added for Stereo Geometry Estimation
 
         # Tab 1: Camera Calibration
         self.create_cam_calib_tab()
@@ -310,6 +372,9 @@ class NotebookGUI:
 
         # Tab 3: Feature Detection and Matching
         self.create_feat_detect_match_tab()
+
+        # Tab 4: Stereo Geometry Estimation
+        self.create_stereo_geometry_estimation_tab()
 
     def _on_mousewheel(self, event):
         # Handle mouse wheel scrolling
@@ -421,12 +486,6 @@ class NotebookGUI:
             self.stereo_img_labels[title].config(image=img_pil)
             self.stereo_img_labels[title].image = img_pil  # Keep a reference to avoid garbage collection
 
-    def stereo_rect_browse_folder(self):
-        folder = filedialog.askdirectory(title="Select Folder with Stereo Image Pairs")
-        if folder:
-            self.stereo_rect_path_entry.delete(0, tk.END)
-            self.stereo_rect_path_entry.insert(0, folder)
-
     def create_feat_detect_match_tab(self):
         tab3 = ttk.Frame(self.notebook)
         self.notebook.add(tab3, text="Feature Detection and Matching")
@@ -517,6 +576,70 @@ class NotebookGUI:
             self.feat_img_labels[title].config(image=img_pil)
             self.feat_img_labels[title].image = img_pil  # Keep a reference to avoid garbage collection
 
+    def create_stereo_geometry_estimation_tab(self):
+        tab4 = ttk.Frame(self.notebook)
+        self.notebook.add(tab4, text="Stereo Geometry Estimation")
+
+        # Controls frame
+        controls_frame = ttk.Frame(tab4)
+        controls_frame.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+
+        # Folder path input
+        ttk.Label(controls_frame, text="Stereo Image Pair Folder Path:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.stereo_geometry_estimation_path_entry = ttk.Entry(controls_frame, width=50)
+        self.stereo_geometry_estimation_path_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        browse_btn = ttk.Button(controls_frame, text="Browse", command=self.stereo_geometry_estimation_browse_folder)
+        browse_btn.grid(row=0, column=2, padx=5, pady=5)
+
+        # Baseline input
+        ttk.Label(controls_frame, text="Baseline (meters):").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.stereo_geometry_baseline_entry = ttk.Entry(controls_frame, width=10)
+        self.stereo_geometry_baseline_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.stereo_geometry_baseline_entry.insert(0, "0.1")  # Default value
+
+        # Run button
+        run_btn = ttk.Button(controls_frame, text="Run", command=self.run_stereo_geometry_estimation)
+        run_btn.grid(row=2, column=1, pady=10)
+
+        # Output text for displaying results
+        self.stereo_geometry_output_text = scrolledtext.ScrolledText(tab4, width=70, height=20, wrap=tk.WORD)
+        self.stereo_geometry_output_text.grid(row=3, column=0, columnspan=2, padx=10, pady=10)
+
+    def run_stereo_geometry_estimation(self):
+        folder_path = self.stereo_geometry_estimation_path_entry.get()
+        if not folder_path:
+            self.stereo_geometry_output_text.delete(1.0, tk.END)
+            self.stereo_geometry_output_text.insert(tk.END, "Please provide a folder path.\n")
+            return
+
+        # Get and validate baseline input
+        baseline_str = self.stereo_geometry_baseline_entry.get().strip()
+        try:
+            baseline = float(baseline_str)
+            if baseline <= 0:
+                raise ValueError("Baseline must be positive.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", f"Invalid baseline value: {e}. Using default (0.1).")
+            baseline = 0.1
+
+        # Run stereo geometry estimation
+        self.stereo_geometry_results = stereo_geometry_estimation(
+            folder_path,
+            baseline=baseline,
+            cameraMatrix=self.cam_calib_results[0][1] if self.cam_calib_results else None
+        )
+
+        # Display results
+        self.stereo_geometry_output_text.delete(1.0, tk.END)
+        if isinstance(self.stereo_geometry_results, str):  # Error case
+            self.stereo_geometry_output_text.insert(tk.END, self.stereo_geometry_results + "\n")
+            return
+
+        self.stereo_geometry_output_text.insert(tk.END, "Stereo Geometry Estimation Results:\n")
+        for key, value in self.stereo_geometry_results.items():
+            self.stereo_geometry_output_text.insert(tk.END, f"{key}:\n{value}\n\n")
+
     def feat_detect_match_browse_folder(self):
         folder = filedialog.askdirectory(title="Select Folder with Image Pair")
         if folder:
@@ -528,6 +651,12 @@ class NotebookGUI:
         if folder:
             self.stereo_rect_path_entry.delete(0, tk.END)
             self.stereo_rect_path_entry.insert(0, folder)
+
+    def stereo_geometry_estimation_browse_folder(self):
+        folder = filedialog.askdirectory(title="Select Folder with Stereo Image Pairs")
+        if folder:
+            self.stereo_geometry_estimation_path_entry.delete(0, tk.END)
+            self.stereo_geometry_estimation_path_entry.insert(0, folder)
 
 # Run the application
 if __name__ == "__main__":
