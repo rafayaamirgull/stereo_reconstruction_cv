@@ -3,792 +3,1494 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import os
 import numpy as np
 import cv2
-import glob
+from PIL import Image, ImageTk
 from io import StringIO
-import open3d as o3d
+import sys
+import backend  # Ensure backend is imported
+import threading
+import queue
+import numpy.core.arrayprint as arrayprint
 
 # Custom output redirection class
+
+
 class RedirectText:
     def __init__(self, text_widget):
         self.text_widget = text_widget
         self.output = StringIO()
+        self.stdout_orig = sys.stdout
+        self.stderr_orig = sys.stderr
 
     def write(self, string):
         self.output.write(string)
-        self.text_widget.insert(tk.END, string)
-        self.text_widget.see(tk.END)
+        try:
+            # Check if widget exists before interacting
+            if self.text_widget and self.text_widget.winfo_exists():
+                self.text_widget.insert(tk.END, string)
+                self.text_widget.see(tk.END)
+        except tk.TclError:
+            pass  # Ignore if widget is destroyed during write
+        except Exception as e:
+            print(f"RedirectText error: {e}")  # Log other errors
 
-    def flush(self):
-        pass
+    def flush(self): pass
+
+    def start_redirect(self):
+        # Store original streams if not already done
+        if not hasattr(self, 'stdout_orig') or self.stdout_orig is None:
+            self.stdout_orig = sys.stdout
+        if not hasattr(self, 'stderr_orig') or self.stderr_orig is None:
+            self.stderr_orig = sys.stderr
+        sys.stdout = self
+
+    def stop_redirect(self):
+        # Ensure sys.stdout is restored only if it's the current redirector instance
+        # and the original stdout exists
+        if isinstance(sys.stdout, RedirectText) and sys.stdout is self:
+            if hasattr(self, 'stdout_orig') and self.stdout_orig:
+                sys.stdout = self.stdout_orig
+            else:  # Fallback if original was somehow lost
+                sys.stdout = sys.__stdout__
 
     def get_output(self):
         return self.output.getvalue()
 
-# Camera Calibration Function
-def cam_calib(base_path):
-    checkerboardsize = (9, 7)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-
-    objp = np.zeros((checkerboardsize[0] * checkerboardsize[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:checkerboardsize[0], 0:checkerboardsize[1]].T.reshape(-1, 2)
-
-    objpoints = []
-    imgpoints = []
-
-    images = glob.glob(f"{base_path}/*.jpg")
-    images = sorted([os.path.join(base_path, img_path) for img_path in images])
-
-    annotation_dir = "chessboard_corners"
-    save_chessboard_corner_ann = False
-    if not os.path.exists(annotation_dir) and save_chessboard_corner_ann:
-        os.mkdir(annotation_dir)
-
-    for fname in images:
-        img = cv2.imread(fname)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        ret, corners = cv2.findChessboardCorners(
-            gray,
-            checkerboardsize,
-            cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_FAST_CHECK + cv2.CALIB_CB_NORMALIZE_IMAGE,
-        )
-
-        if ret:
-            objpoints.append(objp)
-            corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-            imgpoints.append(corners2)
-            if save_chessboard_corner_ann:
-                fname_ = os.path.join(base_path, annotation_dir) + "/" + fname.split("/")[-1].split(".")[0] + "corner_plot.jpg"
-                cv2.drawChessboardCorners(img, checkerboardsize, corners2, ret)
-                cv2.imwrite(fname_, img)
-
-    if not objpoints or not imgpoints:
-        return "Error: Could not find chessboard corners in any images."
-
-    ret, cameraMatrix, dist, rvec, tvec = cv2.calibrateCamera(
-        objpoints, imgpoints, gray.shape[::-1], None, None
-    )
-
-    reprojection_error = 0
-    for i in range(len(objpoints)):
-        imgpoints2, _ = cv2.projectPoints(objpoints[i], rvec[i], tvec[i], cameraMatrix, dist)
-        error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
-        reprojection_error += error
-    reprojection_error /= len(objpoints)
-
-    return {
-        "Camera Matrix": cameraMatrix,
-        "Distortion Parameters": dist,
-        "Reprojection Error": reprojection_error
-    }
-
-# Draw Epipolar Lines Function
-def draw_epilines(img1, img2, lines, pts1, pts2):
-    r, c = img1.shape
-    img1 = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
-    img2 = cv2.cvtColor(img2, cv2.COLOR_GRAY2BGR)
-    for r, pt1, pt2 in zip(lines, pts1, pts2):
-        color = tuple(np.random.randint(0, 255, 3).tolist())
-        x0, y0 = map(int, [0, -r[2] / r[1]])
-        x1, y1 = map(int, [c, -(r[2] + r[0] * c) / r[1]])
-        img1 = cv2.line(img1, (x0, y0), (x1, y1), color, 1)
-        img1 = cv2.circle(img1, tuple(pt1), 5, color, -1)
-        img2 = cv2.circle(img2, tuple(pt2), 5, color, -1)
-    return img1, img2
-
-# Stereo Rectification Function
-def stereo_rect(stereo_path, baseline=0.1, cameraMatrix=None):
-    if cameraMatrix is None:
-        cameraMatrix = np.array([[1000, 0, 1920/2], [0, 1000, 1080/2], [0, 0, 1]])  # Default if not provided
-
-    left_image = glob.glob(f"{stereo_path}/img1.jpg")
-    right_image = glob.glob(f"{stereo_path}/img2.jpg")
-
-    if not left_image or not right_image:
-        return "Error: Missing img1.jpg or img2.jpg in the folder."
-
-    imgL = cv2.imread(left_image[0], cv2.IMREAD_GRAYSCALE)
-    imgR = cv2.imread(right_image[0], cv2.IMREAD_GRAYSCALE)
-
-    K0 = np.array(cameraMatrix)
-    K1 = np.array(cameraMatrix)
-    R = np.eye(3)  # Identity matrix (no rotation)
-    T = np.array([[baseline], [0], [0]])
-    image_size = (int(3840), int(2160))
-
-    # Use SIFT for feature detection and matching
-    sift = cv2.SIFT_create()
-    keypoints_left, descriptors_left = sift.detectAndCompute(imgL, None)
-    keypoints_right, descriptors_right = sift.detectAndCompute(imgR, None)
-    
-    # FLANN parameters
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
-
-    # Use FLANN-based matcher to find correspondences
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    matches = flann.knnMatch(descriptors_left, descriptors_right, k=2)
-    
-    # Filter matches using the Lowe's ratio test
-    pts_left = []
-    pts_right = []
-    for i, (m, n) in enumerate(matches):
-        if m.distance < 0.7 * n.distance:
-            pts_left.append(keypoints_left[m.queryIdx].pt)
-            pts_right.append(keypoints_right[m.trainIdx].pt)
-
-    pts_left = np.int32(pts_left)
-    pts_right = np.int32(pts_right)
-    F, mask = cv2.findFundamentalMat(pts_left, pts_right, cv2.FM_LMEDS)
-
-    # Select only inlier points
-    pts_left = pts_left[mask.ravel() == 1]
-    pts_right = pts_right[mask.ravel() == 1]
-
-    # Compute the Essential Matrix
-    E, mask = cv2.findEssentialMat(pts_left, pts_right, K0, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-    
-    # Decompose the Essential Matrix to recover R and T
-    _, R, T, _ = cv2.recoverPose(E, pts_left, pts_right, K0)
-
-    # Find epilines for original images
-    left_before_lines = cv2.computeCorrespondEpilines(pts_right.reshape(-1, 1, 2), 2, F)
-    left_before_lines = left_before_lines.reshape(-1, 3)
-    imgL_before_rec, _ = draw_epilines(imgL, imgR, left_before_lines, pts_left, pts_right)
-
-    right_before_lines = cv2.computeCorrespondEpilines(pts_left.reshape(-1, 1, 2), 1, F)
-    right_before_lines = right_before_lines.reshape(-1, 3)
-    imgR_before_rec, _ = draw_epilines(imgR, imgL, right_before_lines, pts_right, pts_left)
-
-    # Stereo rectification
-    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K0, None, K1, None, image_size, R, T, alpha=1.0)
-
-    # Rectify Images
-    mapL1, mapL2 = cv2.initUndistortRectifyMap(K0, None, R1, P1, image_size, cv2.CV_32F)
-    mapR1, mapR2 = cv2.initUndistortRectifyMap(K1, None, R2, P2, image_size, cv2.CV_32F)
-
-    imgL_rect = cv2.remap(imgL, mapL1, mapL2, interpolation=cv2.INTER_LINEAR)
-    imgR_rect = cv2.remap(imgR, mapR1, mapR2, interpolation=cv2.INTER_LINEAR)
-
-    # Feature detection and matching on rectified images
-    sift = cv2.SIFT_create()
-    keypoints_left_rect, descriptors_left_rect = sift.detectAndCompute(imgL_rect, None)
-    keypoints_right_rect, descriptors_right_rect = sift.detectAndCompute(imgR_rect, None)
-
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    matches = flann.knnMatch(descriptors_left_rect, descriptors_right_rect, k=2)
-
-    pts_left_rect = []
-    pts_right_rect = []
-    for i, (m, n) in enumerate(matches):
-        if m.distance < 0.7 * n.distance:
-            pts_left_rect.append(keypoints_left_rect[m.queryIdx].pt)
-            pts_right_rect.append(keypoints_right_rect[m.trainIdx].pt)
-
-    pts_left_rect = np.int32(pts_left_rect)
-    pts_right_rect = np.int32(pts_right_rect)
-    F_rect, mask = cv2.findFundamentalMat(pts_left_rect, pts_right_rect, cv2.FM_LMEDS)
-
-    pts_left_rect = pts_left_rect[mask.ravel() == 1]
-    pts_right_rect = pts_right_rect[mask.ravel() == 1]
-
-    # Draw epipolar lines on rectified images
-    left_after_lines = cv2.computeCorrespondEpilines(pts_right_rect.reshape(-1, 1, 2), 2, F_rect)
-    left_after_lines = left_after_lines.reshape(-1, 3)
-    imgL_after_rec, _ = draw_epilines(imgL_rect, imgR_rect, left_after_lines, pts_left_rect, pts_right_rect)
-
-    right_after_lines = cv2.computeCorrespondEpilines(pts_right_rect.reshape(-1, 1, 2), 1, F_rect)
-    right_after_lines = right_after_lines.reshape(-1, 3)
-    imgR_after_rec, _ = draw_epilines(imgR_rect, imgL_rect, right_after_lines, pts_right_rect, pts_left_rect)
-
-    # Resize images for display
-    imgL_before_rec = cv2.resize(imgL_before_rec, (640, 360))
-    imgR_before_rec = cv2.resize(imgR_before_rec, (640, 360))
-    imgL_after_rec = cv2.resize(imgL_after_rec, (640, 360))
-    imgR_after_rec = cv2.resize(imgR_after_rec, (640, 360))
-
-    # Return images for display
-    return {
-        "Original Left": imgL_before_rec,
-        "Original Right": imgR_before_rec,
-        "Rectified Left": imgL_after_rec,
-        "Rectified Right": imgR_after_rec
-    }
-
-# Feature Detection and Matching Function (SIFT contrast threshold removed)
-def feat_detect_match(stereo_path):
-    sift = cv2.SIFT_create()  # Use default SIFT settings
-
-    left_image = glob.glob(f"{stereo_path}/img1.jpg")
-    right_image = glob.glob(f"{stereo_path}/img2.jpg")
-
-    if not left_image or not right_image:
-        return "Error: Missing img1.jpg or img2.jpg in the folder."
-
-    imgL = cv2.imread(left_image[0], cv2.IMREAD_GRAYSCALE)
-    imgR = cv2.imread(right_image[0], cv2.IMREAD_GRAYSCALE)
-
-    if imgL is None or imgR is None:
-        return "Error: Failed to load one or both images."
-
-    keypoints_left, descriptors_left = sift.detectAndCompute(imgL, None)
-    keypoints_right, descriptors_right = sift.detectAndCompute(imgR, None)
-    print(f"SIFT: {len(keypoints_left)} keypoints detected in left image.")
-    print(f"SIFT: {len(keypoints_right)} keypoints detected in right image.")
-    
-    # FLANN parameters
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
-
-    # Use FLANN-based matcher to find correspondences
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    matches = flann.knnMatch(descriptors_left, descriptors_right, k=2)
-    
-    # Filter matches using the Lowe's ratio test
-    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
-    print(f"FLANN Matcher: {len(matches)} matches found, {len(good_matches)} after ratio test.")
-    
-    imgL_with_kp = cv2.drawKeypoints(imgL, keypoints_left, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    imgR_with_kp = cv2.drawKeypoints(imgR, keypoints_right, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    
-    img_matches = cv2.drawMatchesKnn(imgL, keypoints_left, imgR, keypoints_right, matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-    img_good_matches = cv2.drawMatches(imgL, keypoints_left, imgR, keypoints_right, good_matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-    
-    # Resize images for display
-    imgL_with_kp = cv2.resize(imgL_with_kp, (640, 360))
-    imgR_with_kp = cv2.resize(imgR_with_kp, (640, 360))
-    img_matches = cv2.resize(img_matches, (1280, 360))  # Wider image for matches
-    img_good_matches = cv2.resize(img_good_matches, (1280, 360))  # Wider image for matches
-
-    # Extract aligned points
-    pts1 = []
-    pts2 = []
-    for m in good_matches:
-        pts1.append(keypoints_left[m.queryIdx].pt)
-        pts2.append(keypoints_right[m.trainIdx].pt)
-    pts1 = np.asarray(pts1)
-    pts2 = np.asarray(pts2)
-
-    return {
-        "Left Image with Keypoints": imgL_with_kp,
-        "Right Image with Keypoints": imgR_with_kp,
-        "Matched Images Before Lowe's Ratio": img_matches,
-        "Matched Images After Lowe's Ratio": img_good_matches,
-        "Left Aligned Keypoints": pts1,
-        "Right Aligned Keypoints": pts2
-    }
-
-def stereo_geometry_estimation(stereo_path, baseline=0.1, cameraMatrix=None):
-    if cameraMatrix is None:
-        cameraMatrix = np.array([[1000, 0, 1920/2], [0, 1000, 1080/2], [0, 0, 1]])  # Default if not provided
-
-    left_image = glob.glob(f"{stereo_path}/img1.jpg")
-    right_image = glob.glob(f"{stereo_path}/img2.jpg")
-
-    if not left_image or not right_image:
-        return "Error: Missing img1.jpg or img2.jpg in the folder."
-
-    imgL = cv2.imread(left_image[0], cv2.IMREAD_GRAYSCALE)
-    imgR = cv2.imread(right_image[0], cv2.IMREAD_GRAYSCALE)
-
-    K0 = np.array(cameraMatrix)
-    K1 = np.array(cameraMatrix)
-    R = np.eye(3)  # Identity matrix (no rotation)
-    T = np.array([[baseline], [0], [0]])
-    image_size = (int(3840), int(2160))
-
-    # Use SIFT for feature detection and matching
-    sift = cv2.SIFT_create()
-    keypoints_left, descriptors_left = sift.detectAndCompute(imgL, None)
-    keypoints_right, descriptors_right = sift.detectAndCompute(imgR, None)
-    
-    # FLANN parameters
-    FLANN_INDEX_KDTREE = 1
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-    search_params = dict(checks=50)
-
-    # Use FLANN-based matcher to find correspondences
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    matches = flann.knnMatch(descriptors_left, descriptors_right, k=2)
-    
-    # Filter matches using the Lowe's ratio test
-    pts_left = []
-    pts_right = []
-    for i, (m, n) in enumerate(matches):
-        if m.distance < 0.7 * n.distance:
-            pts_left.append(keypoints_left[m.queryIdx].pt)
-            pts_right.append(keypoints_right[m.trainIdx].pt)
-
-    pts_left = np.int32(pts_left)
-    pts_right = np.int32(pts_right)
-    F, mask = cv2.findFundamentalMat(pts_left, pts_right, cv2.FM_LMEDS)
-
-    # Select only inlier points
-    pts_left = pts_left[mask.ravel() == 1]
-    pts_right = pts_right[mask.ravel() == 1]
-
-    # Compute the Essential Matrix
-    E, mask = cv2.findEssentialMat(pts_left, pts_right, K0, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-    
-    # Decompose the Essential Matrix to recover R and T
-    _, R, T, _ = cv2.recoverPose(E, pts_left, pts_right, K0)
-
-    return {
-        "Essential Matrix": E,
-        "Rotation Matrix": R,
-        "Translation Vector": T
-    }
-
-def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVector):
-    if len(pts1) == 0 or len(pts2) == 0 or len(pts1) != len(pts2):
-        return {"Error": "Invalid or mismatched keypoints."}
-
-    # Ensure points are in the correct shape (N x 2)
-    pts1 = np.float32(pts1).reshape(-1, 2)
-    pts2 = np.float32(pts2).reshape(-1, 2)
-
-    # Compute the projection matrices for the two cameras
-    P1 = cameraMatrix @ np.hstack((np.eye(3), np.zeros((3, 1))))  # First camera
-    P2 = cameraMatrix @ np.hstack((rotationMatrix, translationVector))  # Second camera
-
-    # Perform triangulation to get 4D homogeneous points
-    points_4d_hom = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
-
-    # Convert from homogeneous coordinates to 3D
-    points_3d = points_4d_hom[:3] / points_4d_hom[3]
-    points_3d = points_3d.T  # Transpose to (N, 3) for Open3D
-
-    # Create and display point cloud using Open3D (separate window)
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_3d)
-    o3d.visualization.draw_geometries([pcd])
-
-    return {"3D Points": points_3d}
 
 # Main GUI class
 class NotebookGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Notebook Interface")
-        self.root.geometry("1400x900")  # Adjusted size for layout
+        self.root.title("Stereo Vision Toolkit GUI")
+        self.root.geometry("1500x1000")
 
-        # Create a main frame to hold the canvas and scrollbar
+        # --- Scrolling Setup ---
         self.main_frame = ttk.Frame(self.root)
         self.main_frame.pack(fill="both", expand=True)
-
-        # Create a canvas
         self.canvas = tk.Canvas(self.main_frame)
-        self.canvas.pack(side="left", fill="both", expand=True)
-
-        # Add a vertical scrollbar to the canvas
-        self.scrollbar = ttk.Scrollbar(self.main_frame, orient="vertical", command=self.canvas.yview)
-        self.scrollbar.pack(side="right", fill="y")
-
-        # Configure the canvas to use the scrollbar
+        self.scrollbar = ttk.Scrollbar(
+            self.main_frame, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        # Create a frame inside the canvas to hold the notebook
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollable_frame = ttk.Frame(self.canvas)
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas_window = self.canvas.create_window(
+            (0, 0), window=self.scrollable_frame, anchor="nw")
+        self.scrollable_frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Enter>", self._bind_mousewheel)
+        self.canvas.bind("<Leave>", self._unbind_mousewheel)
 
-        # Bind the canvas to update scroll region when the frame size changes
-        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-
-        # Enable mouse wheel scrolling
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)  # Windows
-        self.canvas.bind_all("<Button-4>", self._on_mousewheel)  # Linux (scroll up)
-        self.canvas.bind_all("<Button-5>", self._on_mousewheel)  # Linux (scroll down)
-
-        # Create tabbed interface inside the scrollable frame
+        # --- Notebook ---
         self.notebook = ttk.Notebook(self.scrollable_frame)
-        self.notebook.pack(pady=10, expand=True, fill="both")
+        self.notebook.pack(pady=10, padx=10, expand=True, fill="both")
 
+        # --- State & Image Refs ---
         self.cam_calib_results = None
         self.stereo_rect_results = None
         self.feat_detect_match_results = None
         self.stereo_geometry_results = None
         self.triangulation_results = None
+        self.disparity_calculation_results = None
+        self.sparse_xfeat_results = {}
+        self.image_references = {}
 
-        # Tab 1: Camera Calibration
+        # --- Loading Indicator State ---
+        self.loading_window = None
+        self.task_queue = queue.Queue()
+
+        # --- Path Entries ---
+        self.cam_calib_path_entry = None
+        self.stereo_rect_path_entry = None
+        self.feat_detect_match_path_entry = None
+        self.stereo_geometry_estimation_path_entry = None
+        self.sparse_xfeat_path_entry = None
+
+        # --- Image Labels ---
+        self.stereo_img_labels = {}
+        self.feat_img_labels = {}
+        self.disparity_img_label = None
+        self.sparse_xfeat_match_label = None
+
+        # --- Output Texts ---
+        self.cam_calib_output_text = None
+        self.feat_detect_match_output_text = None
+        self.stereo_geometry_output_text = None
+        self.triangulation_output_text = None
+        self.disparity_output_text = None
+        self.sparse_xfeat_output_text = None
+
+        # --- Create Tabs ---
         self.create_cam_calib_tab()
-
-        # Tab 2: Stereo Rectification
         self.create_stereo_rect_tab()
-
-        # Tab 3: Feature Detection and Matching
         self.create_feat_detect_match_tab()
-
-        # Tab 4: Stereo Geometry Estimation
-        self.create_stereo_geometry_estimation_tab()
-
-        # Tab 5: Triangulation and 3D Reconstruction
+        self.create_stereo_geometry_tab()
         self.create_triangulation_and_reconstruction_tab()
+        self.create_disparity_calculation_tab()
+        self.create_sparse_xfeat_tab()
 
-        # Handle window closing to prevent PhotoImage cleanup errors
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def on_closing(self):
-        """
-        Handle window closing by clearing all PhotoImage references to prevent cleanup errors.
-        """
-        # Clear images in Stereo Rectification tab
-        if hasattr(self, 'stereo_img_labels'):
-            for label in self.stereo_img_labels.values():
-                label.config(image='')  # Clear the image
-                if hasattr(label, 'image'):
-                    label.image = None  # Remove the reference
+    # --- Scroll Frame Configuration ---
+    def _on_frame_configure(self, event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-        # Clear images in Feature Detection and Matching tab
-        if hasattr(self, 'feat_img_labels'):
-            for label in self.feat_img_labels.values():
-                label.config(image='')
-                if hasattr(label, 'image'):
-                    label.image = None
+    def _on_canvas_configure(self, event=None):
+        canvas_width = event.width
+        self.canvas.itemconfig(self.canvas_window, width=canvas_width)
 
-        # Clear image in Triangulation and 3D Reconstruction tab if it exists
-        if hasattr(self, 'point_cloud_label') and self.point_cloud_label is not None:
-            self.point_cloud_label.config(image='')
-            if hasattr(self.point_cloud_label, 'image'):
-                self.point_cloud_label.image = None
+    # --- Mouse Wheel Binding/Unbinding for Scrolling ---
+    def _bind_mousewheel(self, event):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all(
+            "<Button-4>", self._on_mousewheel)  # Linux scroll up
+        # Linux scroll down
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
 
-        # Destroy the window
-        self.root.destroy()
+    def _unbind_mousewheel(self, event):
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
 
     def _on_mousewheel(self, event):
-        # Handle mouse wheel scrolling
-        if event.num == 5 or event.delta < 0:  # Scroll down
-            self.canvas.yview_scroll(1, "units")
-        elif event.num == 4 or event.delta > 0:  # Scroll up
-            self.canvas.yview_scroll(-1, "units")
+        scroll_amount = 0
+        if hasattr(event, 'delta') and event.delta != 0:  # Windows/macOS
+            # Normalize to +/- 1
+            scroll_amount = -1 * int(event.delta / abs(event.delta))
+        elif hasattr(event, 'num'):  # Linux
+            if event.num == 4:
+                scroll_amount = -1  # Scroll up
+            elif event.num == 5:
+                scroll_amount = 1  # Scroll down
+        if scroll_amount != 0:
+            self.canvas.yview_scroll(scroll_amount, "units")
+
+    # --- Loading Indicator Methods ---
+    def _show_loading(self, message="Processing..."):
+        if self.loading_window is not None and self.loading_window.winfo_exists():
+            self.loading_window.destroy()
+        self.loading_window = tk.Toplevel(self.root)
+        self.loading_window.transient(self.root)
+        self.loading_window.title("Working")
+        self.loading_window.resizable(False, False)
+        self.loading_window.grab_set()
+        self.loading_window.protocol(
+            "WM_DELETE_WINDOW", lambda: None)  # Prevent closing
+        ttk.Label(self.loading_window, text=message, font=(
+            "Helvetica", 12)).pack(pady=10, padx=20)
+        pb = ttk.Progressbar(
+            self.loading_window, orient='horizontal', mode='indeterminate', length=200)
+        pb.pack(pady=(0, 15), padx=20, fill='x', expand=True)
+        pb.start(15)
+        # Center the loading window
+        self.loading_window.update_idletasks()  # Ensure window size is calculated
+        root_x, root_y = self.root.winfo_x(), self.root.winfo_y()
+        root_w, root_h = self.root.winfo_width(), self.root.winfo_height()
+        load_w, load_h = self.loading_window.winfo_width(), self.loading_window.winfo_height()
+        x = root_x + (root_w // 2) - (load_w // 2)
+        y = root_y + (root_h // 2) - (load_h // 2)
+        self.loading_window.geometry(f"+{x}+{y}")
+        self.loading_window.lift()
+
+    def _hide_loading(self):
+        if self.loading_window is not None and self.loading_window.winfo_exists():
+            self.loading_window.grab_release()
+            self.loading_window.destroy()
+            self.loading_window = None
+
+    # --- Threading and Queue Handling ---
+    def _run_task_with_loading(self, task_func, args=(), kwargs={}, loading_msg="Processing...", result_handler=None):
+        while not self.task_queue.empty():
+            try:
+                self.task_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._show_loading(loading_msg)
+
+        def worker():
+            try:
+                result = task_func(*args, **kwargs)
+                self.task_queue.put(("SUCCESS", result))
+            except Exception as e:
+                import traceback
+                err_msg = f"Error in task: {e}\n{traceback.format_exc()}"
+                print(f"Error in worker thread: {e}")
+                error_payload = {"Error": err_msg}
+                self.task_queue.put(("ERROR", error_payload))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        self.root.after(100, self._check_queue, result_handler)
+
+    def _check_queue(self, result_handler):
+        try:
+            status, result = self.task_queue.get_nowait()
+            self._hide_loading()
+            if status == "SUCCESS":
+                if result_handler:
+                    try:
+                        result_handler(result)
+                    except Exception as e:
+                        print(f"Error in result handler: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        messagebox.showerror(
+                            "GUI Error", f"Error processing result:\n{e}")
+            elif status == "ERROR":
+                print(f"Task failed:\n{result}")
+                if isinstance(result, dict) and "Error" in result:
+                    error_detail = result["Error"]
+                else:
+                    error_detail = str(result)
+                short_error = error_detail.split('\n')[0]
+                messagebox.showerror(
+                    "Task Error", f"Operation failed:\n{short_error}\n\n(See console/log for details)")
+                if result_handler:
+                    try:
+                        result_handler(result)
+                    except Exception as e:
+                        print(
+                            f"Error in result handler during error processing: {e}")
+
+        except queue.Empty:
+            if self.loading_window and self.loading_window.winfo_exists():
+                self.root.after(100, self._check_queue, result_handler)
+        except Exception as e:
+            print(f"Error checking queue or handling result: {e}")
+            import traceback
+            traceback.print_exc()
+            self._hide_loading()
+            messagebox.showerror(
+                "GUI Error", f"Error checking task status:\n{e}")
+
+    # --- Image/GUI Update Methods ---
+
+    def _clear_image_references(self):
+        for widget in list(self.image_references.keys()):
+            if widget is None:
+                continue
+            try:
+                if widget.winfo_exists():
+                    widget.config(image='')
+            except tk.TclError:
+                pass
+            except Exception as e:
+                print(f"Warning: Error clearing widget {widget}: {e}")
+            self.image_references.pop(widget, None)
+
+    def on_closing(self):
+        print("Closing application...")
+        self._hide_loading()
+        self._clear_image_references()
+        # Stop all redirectors safely
+        for attr_name in dir(self):
+            if attr_name.startswith('redirector_'):
+                redirector = getattr(self, attr_name, None)
+                if isinstance(redirector, RedirectText):
+                    try:
+                        redirector.stop_redirect()
+                    except Exception as e:
+                        print(f"Error stopping redirector {attr_name}: {e}")
+        try:
+            self._unbind_mousewheel(None)
+        except Exception as e:
+            print(f"Error unbinding mousewheel: {e}")
+        try:
+            self.root.destroy()
+        except Exception as e:
+            print(f"Error destroying root window: {e}")
+
+    # _display_image
+    def _display_image(self, label_widget, cv_image_pre_resized):
+        if not label_widget or not label_widget.winfo_exists():
+            self.image_references.pop(label_widget, None)
+            return
+        if cv_image_pre_resized is None or cv_image_pre_resized.size == 0:
+            try:
+                label_widget.config(image='')
+                self.image_references.pop(label_widget, None)
+            except tk.TclError:
+                pass
+            return
+        img_display = cv_image_pre_resized
+        try:
+            img_pil = None
+            if len(img_display.shape) == 2:  # Grayscale
+                img_pil = Image.fromarray(img_display)
+            # Color BGR
+            elif len(img_display.shape) == 3 and img_display.shape[2] == 3:
+                img_rgb = cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB)
+                img_pil = Image.fromarray(img_rgb)
+            else:
+                print(
+                    f"Error: Unsupported image shape for display: {img_display.shape}")
+            if img_pil:
+                img_tk = ImageTk.PhotoImage(image=img_pil)
+                if label_widget.winfo_exists():
+                    label_widget.config(image=img_tk)
+                    self.image_references[label_widget] = img_tk
+                else:
+                    self.image_references.pop(label_widget, None)
+            elif label_widget.winfo_exists():
+                label_widget.config(image='')
+                self.image_references.pop(label_widget, None)
+        except Exception as e:
+            print(f"Error converting/displaying image: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                if label_widget.winfo_exists():
+                    label_widget.config(image='')
+                    self.image_references.pop(label_widget, None)
+            except tk.TclError:
+                pass
+            except Exception as e2:
+                print(f"Error clearing image after error: {e2}")
+
+    # --- Tab Creation Methods ---
 
     def create_cam_calib_tab(self):
         tab1 = ttk.Frame(self.notebook)
-        self.notebook.add(tab1, text="Camera Calibration")
+        self.notebook.add(tab1, text="1. Camera Calibration")
+        controls_frame = ttk.Frame(tab1)
+        controls_frame.pack(pady=5, padx=5, fill='x')
+        ttk.Label(controls_frame, text="Chessboard Images Folder:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w")
 
-        ttk.Label(tab1, text="Chessboard Calibration Patterns Folder Path:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.cam_calib_path_entry = ttk.Entry(tab1, width=50)
-        self.cam_calib_path_entry.grid(row=0, column=1, padx=5, pady=5)
-
-        browse_btn = ttk.Button(tab1, text="Browse", command=self.cam_calib_browse_folder)
+        self.cam_calib_path_entry = ttk.Entry(controls_frame, width=60)
+        self.cam_calib_path_entry.grid(
+            row=0, column=1, padx=5, pady=5, sticky="ew")
+        browse_btn = ttk.Button(
+            controls_frame, text="Browse", command=self.cam_calib_browse_folder)
         browse_btn.grid(row=0, column=2, padx=5, pady=5)
-
-        run_btn = ttk.Button(tab1, text="Run", command=self.run_cam_calib)
+        run_btn = ttk.Button(
+            controls_frame, text="Run Calibration", command=self.run_cam_calib_threaded)
         run_btn.grid(row=1, column=1, pady=10)
+        controls_frame.columnconfigure(1, weight=1)
 
-        self.cam_calib_output_text = scrolledtext.ScrolledText(tab1, width=70, height=20, wrap=tk.WORD)
-        self.cam_calib_output_text.grid(row=2, column=0, columnspan=3, padx=10, pady=10)
-
-    def run_cam_calib(self):
-        folder_path = self.cam_calib_path_entry.get()
-        if not folder_path:
-            self.cam_calib_output_text.delete(1.0, tk.END)
-            self.cam_calib_output_text.insert(tk.END, "Please provide a folder path.\n")
-            return
-
-        self.cam_calib_results = cam_calib(folder_path)
-        self.cam_calib_output_text.delete(1.0, tk.END)
-        if isinstance(self.cam_calib_results, str):  # Error case
-            self.cam_calib_output_text.insert(tk.END, self.cam_calib_results + "\n")
-            return
-
-        self.cam_calib_output_text.insert(tk.END, "Camera Calibrated:\n")
-        for key, value in self.cam_calib_results.items():
-            self.cam_calib_output_text.insert(tk.END, f"{key}:\n{value}\n\n")
-
-    def cam_calib_browse_folder(self):
-        folder = filedialog.askdirectory(title="Select Folder with Chessboard Calibration Patterns")
-        if folder:
-            self.cam_calib_path_entry.delete(0, tk.END)
-            self.cam_calib_path_entry.insert(0, folder)
+        ttk.Label(tab1, text="Output Log & Results:").pack(
+            pady=(10, 0), padx=5, anchor='w')
+        self.cam_calib_output_text = scrolledtext.ScrolledText(
+            tab1, width=80, height=20, wrap=tk.WORD)
+        self.cam_calib_output_text.pack(
+            pady=5, padx=5, expand=True, fill='both')
+        self.redirector_calib = RedirectText(self.cam_calib_output_text)
 
     def create_stereo_rect_tab(self):
         tab2 = ttk.Frame(self.notebook)
-        self.notebook.add(tab2, text="Stereo Rectification")
-
-        # Controls frame
+        self.notebook.add(tab2, text="2. Stereo Rectification")
         controls_frame = ttk.Frame(tab2)
-        controls_frame.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        controls_frame.pack(pady=5, padx=5, fill='x')
+        controls_frame.columnconfigure(1, weight=1)
+        ttk.Label(controls_frame, text="Stereo Pair Folder (img1.jpg, img2.jpg):").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w")
 
-        ttk.Label(controls_frame, text="Stereo Image Pair Folder Path:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.stereo_rect_path_entry = ttk.Entry(controls_frame, width=50)
-        self.stereo_rect_path_entry.grid(row=0, column=1, padx=5, pady=5)
-
-        browse_btn = ttk.Button(controls_frame, text="Browse", command=self.stereo_rect_browse_folder)
+        self.stereo_rect_path_entry = ttk.Entry(controls_frame, width=60)
+        self.stereo_rect_path_entry.grid(
+            row=0, column=1, padx=5, pady=5, sticky="ew")
+        browse_btn = ttk.Button(
+            controls_frame, text="Browse", command=self.stereo_rect_browse_folder)
         browse_btn.grid(row=0, column=2, padx=5, pady=5)
+        run_btn = ttk.Button(
+            controls_frame, text="Run Rectification", command=self.run_stereo_rect_threaded)
+        run_btn.grid(row=1, column=1, pady=10)
+        img_frame = ttk.Frame(tab2)
+        img_frame.pack(pady=10, padx=5, expand=True, fill='both')
 
-        ttk.Label(controls_frame, text="Baseline (centimeters):").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        self.baseline_entry = ttk.Entry(controls_frame, width=10)
-        self.baseline_entry.grid(row=1, column=1, padx=5, pady=5)
-        self.baseline_entry.insert(0, "0.1")  # Default value
-
-        run_btn = ttk.Button(controls_frame, text="Run", command=self.run_stereo_rect)
-        run_btn.grid(row=2, column=1, pady=10)
-
-        # Image display labels
-        self.stereo_img_labels = {
-            "Original Left": tk.Label(tab2),
-            "Original Right": tk.Label(tab2),
-            "Rectified Left": tk.Label(tab2),
-            "Rectified Right": tk.Label(tab2)
-        }
-        for i, (title, label) in enumerate(self.stereo_img_labels.items()):
-            ttk.Label(tab2, text=title).grid(row=3 + 2 * (i // 2), column=i % 2, pady=(0, 2), sticky="n")
-            label.grid(row=4 + 2 * (i // 2), column=i % 2, padx=5, pady=5)
-
-    def run_stereo_rect(self):
-        folder_path = self.stereo_rect_path_entry.get()
-        if not folder_path:
-            for label in self.stereo_img_labels.values():
-                label.config(image='')
-            tk.Label(self.stereo_img_labels["Original Left"].master, text="Please provide a folder path.").grid(row=7, column=0, columnspan=2)
-            return
-        
-        # Get and validate baseline input
-        baseline_str = self.baseline_entry.get().strip()
-        try:
-            baseline = float(baseline_str)
-            if baseline <= 0:
-                raise ValueError("Baseline must be positive.")
-        except ValueError as e:
-            messagebox.showerror("Invalid Input", f"Invalid baseline value: {e}. Using default (0.1).")
-            baseline = 0.1
-
-        camera_matrix = self.cam_calib_results["Camera Matrix"] if self.cam_calib_results else None
-        self.stereo_rect_results = stereo_rect(folder_path, baseline=baseline, cameraMatrix=camera_matrix)
-        
-        if isinstance(self.stereo_rect_results, str):  # Error case
-            for label in self.stereo_img_labels.values():
-                label.config(image='')
-            tk.Label(self.stereo_img_labels["Original Left"].master, text=self.stereo_rect_results).grid(row=7, column=0, columnspan=2)
-            return
-
-        # Display images
-        for title, img in self.stereo_rect_results.items():
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img_pil = tk.PhotoImage(data=cv2.imencode('.png', img_rgb)[1].tobytes())
-            self.stereo_img_labels[title].config(image=img_pil)
-            self.stereo_img_labels[title].image = img_pil  # Keep a reference to avoid garbage collection
+        self.stereo_img_labels = {}
+        titles = ["Original Left", "Original Right",
+                  "Drawn Rectified Left", "Drawn Rectified Right"]
+        cols = 2
+        for i, title in enumerate(titles):
+            frame = ttk.LabelFrame(img_frame, text=title)
+            row, col = divmod(i, cols)
+            frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+            img_frame.columnconfigure(col, weight=1)
+            img_frame.rowconfigure(row, weight=1)
+            label = tk.Label(frame)
+            label.pack(padx=5, pady=5)
+            self.stereo_img_labels[title] = label
 
     def create_feat_detect_match_tab(self):
         tab3 = ttk.Frame(self.notebook)
-        self.notebook.add(tab3, text="Feature Detection and Matching")
-
-        # Controls frame
+        self.notebook.add(tab3, text="3. Feature Detection & Matching")
         controls_frame = ttk.Frame(tab3)
-        controls_frame.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        controls_frame.pack(pady=5, padx=5, fill='x')
+        controls_frame.columnconfigure(1, weight=1)
+        ttk.Label(controls_frame, text="Stereo Pair Folder:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w")
 
-        ttk.Label(controls_frame, text="Image Pair Folder Path:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.feat_detect_match_path_entry = ttk.Entry(controls_frame, width=50)
-        self.feat_detect_match_path_entry.grid(row=0, column=1, padx=5, pady=5)
-
-        browse_btn = ttk.Button(controls_frame, text="Browse", command=self.feat_detect_match_browse_folder)
+        self.feat_detect_match_path_entry = ttk.Entry(controls_frame, width=60)
+        self.feat_detect_match_path_entry.grid(
+            row=0, column=1, padx=5, pady=5, sticky="ew")
+        browse_btn = ttk.Button(
+            controls_frame, text="Browse", command=self.feat_detect_match_browse_folder)
         browse_btn.grid(row=0, column=2, padx=5, pady=5)
+        run_btn = ttk.Button(controls_frame, text="Run Detection & Matching",
+                             command=self.run_feat_detect_match_threaded)
+        run_btn.grid(row=1, column=1, pady=10)
+        img_frame = ttk.Frame(tab3)
+        img_frame.pack(pady=10, padx=5, expand=True, fill='both')
+        img_frame.columnconfigure(0, weight=1)
+        img_frame.columnconfigure(1, weight=1)
+        img_frame.rowconfigure(0, weight=1)
+        img_frame.rowconfigure(1, weight=1)
+        img_frame.rowconfigure(2, weight=1)
+        self.feat_img_labels = {}
 
-        run_btn = ttk.Button(controls_frame, text="Run", command=self.run_feat_detect_match)
-        run_btn.grid(row=1, column=1, pady=10)  # Adjusted row since contrast threshold is removed
+        titles = ["Left Image with Keypoints", "Right Image with Keypoints",
+                  "Matched Images Before Lowe's Ratio", "Matched Images After Lowe's Ratio"]
+        frame_kp_l = ttk.LabelFrame(img_frame, text=titles[0])
+        frame_kp_l.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+        self.feat_img_labels[titles[0]] = tk.Label(frame_kp_l)
+        self.feat_img_labels[titles[0]].pack(padx=5, pady=5)
 
-        # Image display labels
-        self.feat_img_labels = {
-            "Left Image with Keypoints": tk.Label(tab3),
-            "Right Image with Keypoints": tk.Label(tab3),
-            "Matched Images Before Lowe's Ratio": tk.Label(tab3),
-            "Matched Images After Lowe's Ratio": tk.Label(tab3)
-        }
+        frame_kp_r = ttk.LabelFrame(img_frame, text=titles[1])
+        frame_kp_r.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
+        self.feat_img_labels[titles[1]] = tk.Label(frame_kp_r)
+        self.feat_img_labels[titles[1]].pack(padx=5, pady=5)
 
-        # First two images side by side
-        for i, title in enumerate(["Left Image with Keypoints", "Right Image with Keypoints"]):
-            ttk.Label(tab3, text=title).grid(row=2, column=i, pady=(0, 2), sticky="n")  # Adjusted row
-            self.feat_img_labels[title].grid(row=3, column=i, padx=5, pady=5)  # Adjusted row
+        frame_match_raw = ttk.LabelFrame(img_frame, text=titles[2])
+        frame_match_raw.grid(row=1, column=0, columnspan=2,
+                             padx=5, pady=5, sticky="nsew")
+        self.feat_img_labels[titles[2]] = tk.Label(frame_match_raw)
+        self.feat_img_labels[titles[2]].pack(padx=5, pady=5)
 
-        # Last two images stacked vertically below, spanning both columns
-        ttk.Label(tab3, text="Matched Images Before Lowe's Ratio").grid(row=4, column=0, columnspan=2, pady=(0, 2), sticky="n")  # Adjusted row
-        self.feat_img_labels["Matched Images Before Lowe's Ratio"].grid(row=5, column=0, columnspan=2, padx=5, pady=5)  # Adjusted row
+        frame_match_good = ttk.LabelFrame(img_frame, text=titles[3])
+        frame_match_good.grid(row=2, column=0, columnspan=2,
+                              padx=5, pady=5, sticky="nsew")
+        self.feat_img_labels[titles[3]] = tk.Label(frame_match_good)
+        self.feat_img_labels[titles[3]].pack(padx=5, pady=5)
 
-        ttk.Label(tab3, text="Matched Images After Lowe's Ratio").grid(row=6, column=0, columnspan=2, pady=(0, 2), sticky="n")  # Adjusted row
-        self.feat_img_labels["Matched Images After Lowe's Ratio"].grid(row=7, column=0, columnspan=2, padx=5, pady=5)  # Adjusted row
+        log_frame = ttk.Frame(tab3)
+        log_frame.pack(pady=(0, 5), padx=5, fill='x')
+        ttk.Label(log_frame, text="Output Log (Counts & Status):").pack(
+            pady=(5, 0), anchor='w')
 
-        # Output text for debug/info
-        self.feat_detect_match_output_text = scrolledtext.ScrolledText(tab3, width=70, height=5, wrap=tk.WORD)
-        self.feat_detect_match_output_text.grid(row=8, column=0, columnspan=2, padx=10, pady=5)  # Adjusted row
+        self.feat_detect_match_output_text = scrolledtext.ScrolledText(
+            log_frame, width=80, height=5, wrap=tk.WORD)
+        self.feat_detect_match_output_text.pack(
+            pady=5, padx=0, fill='x', expand=False)
+        self.redirector_feat = RedirectText(self.feat_detect_match_output_text)
 
-    def run_feat_detect_match(self):
-        folder_path = self.feat_detect_match_path_entry.get()
-        if not folder_path:
-            for label in self.feat_img_labels.values():
-                label.config(image='')
-            self.feat_detect_match_output_text.delete(1.0, tk.END)
-            self.feat_detect_match_output_text.insert(tk.END, "Please provide a folder path.\n")
-            return
-
-        # Redirect print output to textbox
-        redirect = RedirectText(self.feat_detect_match_output_text)
-        import sys
-        sys.stdout = redirect
-
-        self.feat_detect_match_results = feat_detect_match(folder_path)  # Removed contrast_threshold parameter
-        
-        if isinstance(self.feat_detect_match_results, str):  # Error case
-            for label in self.feat_img_labels.values():
-                label.config(image='')
-            self.feat_detect_match_output_text.delete(1.0, tk.END)
-            self.feat_detect_match_output_text.insert(tk.END, self.feat_detect_match_results + "\n")
-            return
-
-        # Restore stdout
-        sys.stdout = sys.__stdout__
-
-        # Display images (ignoring keypoints for display)
-        ignored_keys = ["Left Aligned Keypoints", "Right Aligned Keypoints"]
-        for title, img in self.feat_detect_match_results.items():
-            if title in ignored_keys:
-                continue
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img_pil = tk.PhotoImage(data=cv2.imencode('.png', img_rgb)[1].tobytes())
-            self.feat_img_labels[title].config(image=img_pil)
-            self.feat_img_labels[title].image = img_pil  # Keep a reference to avoid garbage collection
-
-    def create_stereo_geometry_estimation_tab(self):
+    def create_stereo_geometry_tab(self):
         tab4 = ttk.Frame(self.notebook)
-        self.notebook.add(tab4, text="Stereo Geometry Estimation")
-
-        # Controls frame
+        self.notebook.add(tab4, text="4. Stereo Geometry")
         controls_frame = ttk.Frame(tab4)
-        controls_frame.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        controls_frame.pack(pady=5, padx=5, fill='x')
+        ttk.Label(controls_frame, text="Stereo Pair Folder:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w")
 
-        # Folder path input
-        ttk.Label(controls_frame, text="Stereo Image Pair Folder Path:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.stereo_geometry_estimation_path_entry = ttk.Entry(controls_frame, width=50)
-        self.stereo_geometry_estimation_path_entry.grid(row=0, column=1, padx=5, pady=5)
-
-        browse_btn = ttk.Button(controls_frame, text="Browse", command=self.stereo_geometry_estimation_browse_folder)
+        self.stereo_geometry_estimation_path_entry = ttk.Entry(
+            controls_frame, width=60)
+        self.stereo_geometry_estimation_path_entry.grid(
+            row=0, column=1, padx=5, pady=5, sticky="ew")
+        browse_btn = ttk.Button(controls_frame, text="Browse",
+                                command=self.stereo_geometry_estimation_browse_folder)
         browse_btn.grid(row=0, column=2, padx=5, pady=5)
+        run_btn = ttk.Button(controls_frame, text="Run",
+                             command=self.run_stereo_geometry_estimation_threaded)
+        run_btn.grid(row=1, column=1, pady=10)
+        controls_frame.columnconfigure(1, weight=1)
 
-        # Baseline input
-        ttk.Label(controls_frame, text="Baseline (centimeters):").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        self.stereo_geometry_baseline_entry = ttk.Entry(controls_frame, width=10)
-        self.stereo_geometry_baseline_entry.grid(row=1, column=1, padx=5, pady=5)
-        self.stereo_geometry_baseline_entry.insert(0, "0.1")  # Default value
-
-        # Run button
-        run_btn = ttk.Button(controls_frame, text="Run", command=self.run_stereo_geometry_estimation)
-        run_btn.grid(row=2, column=1, pady=10)
-
-        # Output text for displaying results
-        self.stereo_geometry_output_text = scrolledtext.ScrolledText(tab4, width=70, height=20, wrap=tk.WORD)
-        self.stereo_geometry_output_text.grid(row=3, column=0, columnspan=2, padx=10, pady=10)
-
-    def run_stereo_geometry_estimation(self):
-        folder_path = self.stereo_geometry_estimation_path_entry.get()
-        if not folder_path:
-            self.stereo_geometry_output_text.delete(1.0, tk.END)
-            self.stereo_geometry_output_text.insert(tk.END, "Please provide a folder path.\n")
-            return
-
-        # Get and validate baseline input
-        baseline_str = self.stereo_geometry_baseline_entry.get().strip()
-        try:
-            baseline = float(baseline_str)
-            if baseline <= 0:
-                raise ValueError("Baseline must be positive.")
-        except ValueError as e:
-            messagebox.showerror("Invalid Input", f"Invalid baseline value: {e}. Using default (0.1).")
-            baseline = 0.1
-
-        # Run stereo geometry estimation
-        camera_matrix = self.cam_calib_results["Camera Matrix"] if self.cam_calib_results else None
-        self.stereo_geometry_results = stereo_geometry_estimation(
-            folder_path,
-            baseline=baseline,
-            cameraMatrix=camera_matrix
-        )
-
-        # Display results
-        self.stereo_geometry_output_text.delete(1.0, tk.END)
-        if isinstance(self.stereo_geometry_results, str):  # Error case
-            self.stereo_geometry_output_text.insert(tk.END, self.stereo_geometry_results + "\n")
-            return
-
-        self.stereo_geometry_output_text.insert(tk.END, "Stereo Geometry Estimation Results:\n")
-        for key, value in self.stereo_geometry_results.items():
-            self.stereo_geometry_output_text.insert(tk.END, f"{key}:\n{value}\n\n")
+        ttk.Label(tab4, text="Output Log & Results:").pack(
+            pady=(10, 0), padx=5, anchor='w')
+        self.stereo_geometry_output_text = scrolledtext.ScrolledText(
+            tab4, width=80, height=20, wrap=tk.WORD)
+        self.stereo_geometry_output_text.pack(
+            pady=5, padx=5, expand=True, fill='both')
+        self.redirector_geom = RedirectText(self.stereo_geometry_output_text)
 
     def create_triangulation_and_reconstruction_tab(self):
         tab5 = ttk.Frame(self.notebook)
-        self.notebook.add(tab5, text="Triangulation and 3D Reconstruction")
-
-        # Controls frame
+        self.notebook.add(tab5, text="5. Triangulation (Feature-Based)")
         controls_frame = ttk.Frame(tab5)
-        controls_frame.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        controls_frame.pack(pady=5, padx=5, fill='x', side='top')
+        ttk.Label(
+            controls_frame, text="Requires results from Tab 1 (Calibration) and Tab 3 (Matching).").pack(pady=5)
 
-        ttk.Label(controls_frame, text="Press Run to execute (requires Feature Detection and Stereo Geometry results):").grid(
-            row=0, column=0, padx=5, pady=5, sticky="e"
+        run_btn = ttk.Button(controls_frame, text="Run Triangulation & Visualize 3D",
+                             command=self.run_triangulation_and_reconstruction_threaded)
+        run_btn.pack(pady=10)
+        output_frame = ttk.Frame(tab5)
+        output_frame.pack(pady=5, padx=5, fill='x', side='top')
+        ttk.Label(output_frame, text="Output Log & Status:").pack(
+            pady=(5, 0), anchor='w')
+
+        self.triangulation_output_text = scrolledtext.ScrolledText(
+            output_frame, width=80, height=10, wrap=tk.WORD)
+        self.triangulation_output_text.pack(
+            pady=5, padx=0, expand=False, fill='x')
+        self.redirector_tri = RedirectText(self.triangulation_output_text)
+
+    def create_disparity_calculation_tab(self):
+        tab6 = ttk.Frame(self.notebook)
+        self.notebook.add(tab6, text="6. Disparity & 3D (Dense)")
+
+        controls_frame = ttk.Frame(tab6)
+        controls_frame.pack(pady=5, padx=5, fill='x')
+        # Allow buttons to space out if needed
+        controls_frame.columnconfigure(1, weight=1)
+        ttk.Label(controls_frame, text="Requires results from Tab 1 (Calibration) and Tab 2 (Rectification).").grid(
+            row=0, column=0, columnspan=3, padx=5, pady=5, sticky="w")
+        run_disparity_btn = ttk.Button(
+            controls_frame, text="Run Disparity", command=self.run_disparity_calculation_threaded)
+        run_disparity_btn.grid(row=1, column=0, pady=10, padx=5)
+        run_3d_btn = ttk.Button(
+            controls_frame, text="Visualize 3D Point Cloud", command=self.run_visualize_3d_threaded)
+        run_3d_btn.grid(row=1, column=1, pady=10, padx=5)
+
+        # --- Output Frame (Image + Log) ---
+        output_frame = ttk.Frame(tab6)
+        # Make this frame fill space
+        output_frame.pack(pady=10, padx=5, expand=True, fill='both')
+        output_frame.columnconfigure(0, weight=1)
+        output_frame.rowconfigure(0, weight=1)  # Image row can expand
+        # Log row has fixed height based on widget
+        output_frame.rowconfigure(1, weight=0)
+
+        # Image Display Frame
+        img_frame = ttk.LabelFrame(
+            output_frame, text="Filtered Disparity Heatmap (Normalized)")
+        img_frame.grid(row=0, column=0, padx=5, pady=5,
+                       sticky="nsew")  # Grid into output_frame
+        # Add internal frame to center label AND prevent label from resizing the parent Labelframe
+        img_inner_frame = ttk.Frame(img_frame)
+        img_inner_frame.pack(expand=True)  # Center content
+        self.disparity_img_label = tk.Label(img_inner_frame)
+        self.disparity_img_label.pack(padx=5, pady=5)
+
+        # Log Display Frame
+        log_frame = ttk.Frame(output_frame)
+        log_frame.grid(row=1, column=0, padx=5, pady=(
+            10, 5), sticky="ew")  # Grid below image
+        ttk.Label(log_frame, text="Output Log (Status):").pack(
+            pady=(0, 2), anchor='w')
+        self.disparity_output_text = scrolledtext.ScrolledText(
+            log_frame, width=80, height=5, wrap=tk.WORD)  # Reduced height
+        self.disparity_output_text.pack(
+            # Don't expand vertically
+            pady=(0, 5), padx=0, fill='x', expand=False)
+
+        # Redirector
+        self.redirector_disp = RedirectText(self.disparity_output_text)
+
+    # XFeat Tab Creation
+
+    def create_sparse_xfeat_tab(self):
+        tab7 = ttk.Frame(self.notebook)
+        self.notebook.add(tab7, text="7. Sparse Reconstruction (XFeat Exp.)")
+
+        # --- Controls Frame ---
+        controls_frame = ttk.Frame(tab7)
+        controls_frame.pack(pady=5, padx=5, fill='x')
+        controls_frame.columnconfigure(1, weight=1)  # Make entry expand
+
+        # Path Entry
+        ttk.Label(controls_frame, text="Stereo Pair Folder:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w")
+        self.sparse_xfeat_path_entry = ttk.Entry(controls_frame, width=60)
+        self.sparse_xfeat_path_entry.grid(
+            row=0, column=1, padx=5, pady=5, sticky="ew")
+        browse_btn = ttk.Button(
+            controls_frame, text="Browse", command=self.sparse_xfeat_browse_folder)
+        browse_btn.grid(row=0, column=2, padx=5, pady=5)
+
+        # Dependency Info Label
+        dep_label_text = ("Matching requires images. "
+                          "Reconstruction requires successful Matching results \n"
+                          "AND successful Calibration (Tab 1 for K) "
+                          "AND successful Feature Matching (Tab 3 for R, T).")
+        ttk.Label(controls_frame, text=dep_label_text, foreground="blue").grid(
+            row=1, column=0, columnspan=3, padx=5, pady=(5, 5), sticky="w")
+
+        # Button Frame
+        button_frame = ttk.Frame(controls_frame)
+        button_frame.grid(row=2, column=0, columnspan=3, pady=5)
+
+        # Matching Button
+        match_btn = ttk.Button(button_frame, text="1. Run XFeat Matching",
+                               command=self.run_sparse_xfeat_matching_threaded)
+        match_btn.pack(side=tk.LEFT, padx=10, pady=5)
+
+        # Reconstruction Button
+        recon_btn = ttk.Button(button_frame, text="2. Run 3D Reconstruction",
+                               command=self.run_sparse_xfeat_reconstruction_threaded)
+        recon_btn.pack(side=tk.LEFT, padx=10, pady=5)
+
+        # --- Output Frame (Image + Log) ---
+        output_frame = ttk.Frame(tab7)
+        # Make this frame fill space
+        output_frame.pack(pady=10, padx=5, expand=True, fill='both')
+        # Configure rows: Image gets weight 1 (expandable), Log gets weight 0 (fixed)
+        output_frame.columnconfigure(0, weight=1)
+        output_frame.rowconfigure(0, weight=1)  # Image row can expand
+        # Log row has fixed height based on widget
+        output_frame.rowconfigure(1, weight=0)
+
+        # Image Display Frame
+        img_frame = ttk.LabelFrame(
+            output_frame, text="XFeat Matches Visualization")
+        img_frame.grid(row=0, column=0, padx=5, pady=5,
+                       sticky="nsew")  # Grid into output_frame
+        # Add internal frame to center label AND prevent label from resizing the parent Labelframe
+        img_inner_frame = ttk.Frame(img_frame)
+        img_inner_frame.pack(expand=True)  # Center content
+        self.sparse_xfeat_match_label = tk.Label(img_inner_frame)
+        self.sparse_xfeat_match_label.pack(
+            padx=5, pady=5)  # Pack inside inner frame
+
+        # Log Display Frame
+        log_frame = ttk.Frame(output_frame)
+        log_frame.grid(row=1, column=0, padx=5, pady=(
+            10, 5), sticky="ew")  # Grid below image
+        ttk.Label(log_frame, text="Output Log (Status & Counts):").pack(
+            pady=(0, 2), anchor='w')
+        self.sparse_xfeat_output_text = scrolledtext.ScrolledText(
+            log_frame, width=80, height=8, wrap=tk.WORD)
+        self.sparse_xfeat_output_text.pack(
+            # Don't expand vertically
+            pady=(0, 5), padx=0, fill='x', expand=False)
+        self.redirector_xfeat = RedirectText(self.sparse_xfeat_output_text)
+
+    # --- Action Methods ---
+
+    # Actions for Tabs 1-5 use the versions from the previous response
+    # 1. Camera Calibration
+
+    def run_cam_calib_threaded(self):
+        # ... (Keep code from previous response) ...
+        folder_path = self.cam_calib_path_entry.get()
+        if self.cam_calib_output_text:
+            self.cam_calib_output_text.delete(1.0, tk.END)
+        else:
+            print("Warning: cam_calib_output_text not initialized.")
+            return
+
+        if not folder_path or not os.path.isdir(folder_path):
+            messagebox.showerror("Error", "Please select a valid folder path.")
+            return
+
+        if not hasattr(self, 'redirector_calib') or not self.redirector_calib:
+            print("Error: redirector_calib not initialized.")
+            return
+
+        self.redirector_calib.start_redirect()
+        print(f"Starting Camera Calibration: {folder_path}")
+        self._run_task_with_loading(task_func=backend.cam_calib, args=(
+            folder_path,), loading_msg="Running Calibration...", result_handler=self._handle_cam_calib_result)
+
+    def _handle_cam_calib_result(self, results):
+        redirector = getattr(self, 'redirector_calib', None)
+
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results["Error"]
+            print(f"Error: {error_msg}")
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Calibration Failed", error_msg)
+            self.cam_calib_results = results
+
+        elif isinstance(results, dict):
+            self.cam_calib_results = results
+            print("\n--- Calibration Results ---")
+            with np.printoptions(precision=4, suppress=True):
+                for key, value in self.cam_calib_results.items():
+                    print(f"{key}:")
+                    if isinstance(value, np.ndarray):
+                        print(value)
+                    elif isinstance(value, float):
+                        print(f"{value:.4f}")
+                    else:
+                        print(value)
+                    print("-" * 20)
+
+            print("\nCalibration process completed successfully.")
+            if redirector:
+                redirector.stop_redirect()
+            reproj_error = self.cam_calib_results.get(
+                'Reprojection Error', 'N/A')
+            messagebox.showinfo("Success", f"Calibration complete.\nReprojection Error: {reproj_error:.4f}" if isinstance(
+                reproj_error, float) else "Calibration complete.")
+
+        else:
+            err_msg = f"Unexpected calibration result type: {type(results)}. Content: {results}"
+            print(f"Error: {err_msg}")
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Error", err_msg)
+            self.cam_calib_results = {"Error": err_msg}
+
+    # 2. Stereo Rectification
+    def run_stereo_rect_threaded(self):
+        folder_path = self.stereo_rect_path_entry.get()
+        for label in self.stereo_img_labels.values():
+            self._display_image(label, None)
+
+        if not folder_path or not os.path.isdir(folder_path):
+            messagebox.showerror("Error", "Please select a valid folder path.")
+            return
+        if not self.cam_calib_results or "Error" in self.cam_calib_results:
+            messagebox.showerror(
+                "Missing Data", "Run Camera Calibration (Tab 1) successfully first.")
+            return
+
+        camera_matrix = self.cam_calib_results.get("Camera Matrix")
+        dist_coeffs = self.cam_calib_results.get("Distortion Parameters")
+
+        if camera_matrix is None:
+            messagebox.showerror(
+                "Missing Data", "Camera Matrix not found in Calibration results.")
+            return
+        print(f"Starting Stereo Rectification: {folder_path}")
+
+        if dist_coeffs is None:
+            print("Assuming zero distortion (None found in calibration results).")
+
+        self._run_task_with_loading(
+            task_func=backend.stereo_rect,
+            kwargs={'stereo_path': folder_path,
+                    'cameraMatrix': camera_matrix, 'distCoeffs': dist_coeffs},
+            loading_msg="Running Rectification...",
+            result_handler=self._handle_stereo_rect_result
         )
 
-        run_btn = ttk.Button(controls_frame, text="Run", command=self.run_create_triangulation_and_reconstruction)
-        run_btn.grid(row=1, column=0, pady=10)
+    def _handle_stereo_rect_result(self, results):
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results['Error']
+            print(f"Error: {error_msg}")
+            messagebox.showerror("Rectification Failed", error_msg)
+            self.stereo_rect_results = results
 
-        # Output text for displaying results or errors
-        self.triangulation_output_text = scrolledtext.ScrolledText(tab5, width=70, height=20, wrap=tk.WORD)
-        self.triangulation_output_text.grid(row=2, column=0, columnspan=2, padx=10, pady=10)
+        elif isinstance(results, dict):
+            self.stereo_rect_results = results
+            print("Stereo Rectification Success. Displaying images...")
+            display_keys = ["Original Left", "Original Right",
+                            "Drawn Rectified Left", "Drawn Rectified Right"]
+            fixed_size = (640, 360)
+            for title in display_keys:
+                img_label = self.stereo_img_labels.get(title)
+                img_to_display = self.stereo_rect_results.get(title)
+                if img_label and img_to_display is not None:
+                    try:
+                        self._display_image(img_label, cv2.resize(
+                            img_to_display, fixed_size, interpolation=cv2.INTER_AREA))
+                    except Exception as e:
+                        print(
+                            f"Error resizing/displaying image '{title}': {e}")
+                        self._display_image(img_label, None)
 
-        # Remove the point cloud label since we're using the Open3D window
-        self.point_cloud_label = None
+                elif img_label:
+                    print(f"Warning: Image '{title}' is None in results.")
+                    self._display_image(img_label, None)
 
-    def run_create_triangulation_and_reconstruction(self):
-        # Clear previous output
-        self.triangulation_output_text.delete(1.0, tk.END)
+            messagebox.showinfo("Success", "Rectification complete.")
 
-        # Check if required results are available
-        if not self.cam_calib_results:
-            self.triangulation_output_text.insert(tk.END, "Error: Run 'Camera Calibration' tab first.\n")
+        else:
+            err_msg = f"Unexpected rectification result type: {type(results)}. Content: {results}"
+            print(f"Error: {err_msg}")
+            messagebox.showerror("Error", err_msg)
+            self.stereo_rect_results = {"Error": err_msg}
+
+    # 3. Feature Detection and Matching
+    def run_feat_detect_match_threaded(self):
+        folder_path = self.feat_detect_match_path_entry.get()
+        if self.feat_detect_match_output_text:
+            self.feat_detect_match_output_text.delete(1.0, tk.END)
+        else:
+            print("Warning: feat_detect_match_output_text not initialized.")
             return
-        if not self.feat_detect_match_results:
-            self.triangulation_output_text.insert(tk.END, "Error: Run 'Feature Detection and Matching' tab first.\n")
-            return
-        if not self.stereo_geometry_results:
-            self.triangulation_output_text.insert(tk.END, "Error: Run 'Stereo Geometry Estimation' tab first.\n")
-            return
 
-        # Extract required data
-        pts1 = self.feat_detect_match_results["Left Aligned Keypoints"]
-        pts2 = self.feat_detect_match_results["Right Aligned Keypoints"]
-        camera_matrix = self.cam_calib_results["Camera Matrix"]
-        rotation_matrix = self.stereo_geometry_results["Rotation Matrix"]
-        translation_vector = self.stereo_geometry_results["Translation Vector"]
+        for label in self.feat_img_labels.values():
+            self._display_image(label, None)
 
-        # Perform triangulation
-        self.triangulation_results = triangulation_and_3D_reconstruction(
-            pts1, pts2, camera_matrix, rotation_matrix, translation_vector
+        if not folder_path or not os.path.isdir(folder_path):
+            messagebox.showerror("Error", "Please select a valid folder path.")
+            return
+        camera_matrix = self.cam_calib_results.get(
+            "Camera Matrix") if self.cam_calib_results and "Error" not in self.cam_calib_results else None
+        if not hasattr(self, 'redirector_feat') or not self.redirector_feat:
+            print("Error: redirector_feat not initialized.")
+            return
+        self.redirector_feat.start_redirect()
+        print(f"Starting Feature Detection & Matching: {folder_path}")
+        if camera_matrix is None:
+            print("Using default intrinsics (Calibration not run or failed).")
+        else:
+            print("Using intrinsics from Calibration tab.")
+        self._run_task_with_loading(
+            task_func=backend.feat_detect_match,
+            kwargs={'stereo_path': folder_path, 'cameraMatrix': camera_matrix},
+            loading_msg="Running Detection & Matching...",
+            result_handler=self._handle_feat_detect_match_result
         )
 
-        if "Error" in self.triangulation_results:
-            self.triangulation_output_text.insert(tk.END, self.triangulation_results["Error"] + "\n")
+    def _handle_feat_detect_match_result(self, results):
+        redirector = getattr(self, 'redirector_feat', None)
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results['Error']
+            print(f"Error: {error_msg}")
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Detection/Matching Failed", error_msg)
+            self.feat_detect_match_results = results
+        
+        elif isinstance(results, dict):
+            self.feat_detect_match_results = results
+            if self.feat_detect_match_output_text:
+                self.feat_detect_match_output_text.delete(1.0, tk.END)
+            kp_l = results.get("Num Keypoints Left", "N/A")
+            kp_r = results.get("Num Keypoints Right", "N/A")
+            match_raw = results.get("Num Raw Matches", "N/A")
+            match_good = results.get("Num Good Matches", "N/A")
+            summary = (f"--- Detection & Matching Summary ---\n"
+                       f"Left Image Keypoints: {kp_l}\nRight Image Keypoints: {kp_r}\n"
+                       f"Raw Matches (knn=2): {match_raw}\nGood Matches (Ratio Test): {match_good}\n"
+                       f"------------------------------------\nSUCCESS: Detection & matching complete.\n")
+        
+            if self.feat_detect_match_output_text:
+                self.feat_detect_match_output_text.insert(tk.END, summary)
+                self.feat_detect_match_output_text.see(tk.END)
+            if redirector:
+                redirector.stop_redirect()
+        
+            for title, img_label in self.feat_img_labels.items():
+                img = self.feat_detect_match_results.get(title)
+                if img is not None:
+                    fixed_size = (
+                        1280, 360) if "Matched Images" in title else (640, 360)
+                    try:
+                        self._display_image(img_label, cv2.resize(
+                            img, fixed_size, interpolation=cv2.INTER_AREA))
+                    except Exception as e:
+                        print(
+                            f"Error resizing/displaying image '{title}': {e}")
+                        self._display_image(img_label, None)
+                else:
+                    print(f"Warning: Image '{title}' is None.")
+                    self._display_image(img_label, None)
+            messagebox.showinfo("Success", "Detection & matching complete.")
+        
+        else:
+            err_msg = f"Unexpected matching result type: {type(results)}. Content: {results}"
+            print(f"Error: {err_msg}")
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Error", err_msg)
+            self.feat_detect_match_results = {"Error": err_msg}
+
+    # 4. Stereo Geometry Estimation
+    def run_stereo_geometry_estimation_threaded(self):
+        folder_path = self.stereo_geometry_estimation_path_entry.get()
+        
+        if self.stereo_geometry_output_text:
+            self.stereo_geometry_output_text.delete(1.0, tk.END)
+        else:
+            print("Warning: stereo_geometry_output_text not initialized.")
+            return
+        
+        if not folder_path or not os.path.isdir(folder_path):
+            messagebox.showerror("Error", "Please select a valid folder path.")
+            return
+        
+        camera_matrix = self.cam_calib_results.get(
+            "Camera Matrix") if self.cam_calib_results and "Error" not in self.cam_calib_results else None
+        
+        if not hasattr(self, 'redirector_geom') or not self.redirector_geom:
+            print("Error: redirector_geom not initialized.")
+            return
+        
+        self.redirector_geom.start_redirect()
+        print(f"Starting Standalone Stereo Geometry Estimation: {folder_path}")
+        
+        if camera_matrix is None:
+            print("Using default intrinsics (Calibration not run or failed).")
+        else:
+            print("Using intrinsics from Calibration tab.")
+        
+        self._run_task_with_loading(
+            task_func=backend.stereo_geometry_estimation,
+            kwargs={'stereo_path': folder_path, 'cameraMatrix': camera_matrix},
+            loading_msg="Estimating Geometry...",
+            result_handler=self._handle_stereo_geometry_result
+        )
+
+    def _handle_stereo_geometry_result(self, results):
+        redirector = getattr(self, 'redirector_geom', None)
+        
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results['Error']
+            print(f"Error: {error_msg}")
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Geometry Estimation Failed", error_msg)
+            self.stereo_geometry_results = results
+        
+        elif isinstance(results, dict):
+            self.stereo_geometry_results = results
+            if self.stereo_geometry_output_text:
+                self.stereo_geometry_output_text.delete(1.0, tk.END)
+        
+            output_str = "--- Stereo Geometry Results ---\n\n"
+        
+            with np.printoptions(precision=4, suppress=True):
+                f_mat = results.get("Fundamental Matrix")
+                output_str += "Fundamental Matrix (F):\n" + (np.array2string(
+                    f_mat) if f_mat is not None else "Not computed or failed.") + "\n\n"
+                e_mat = results.get("Essential Matrix")
+                det_e = results.get("Determinant E")
+                svd_count_e = results.get("Non Zero SVD E")
+                svd_vals_e = results.get("Singular Values E")
+                output_str += "Essential Matrix (E):\n"
+        
+                if e_mat is not None:
+                    output_str += np.array2string(e_mat) + "\n"
+                    if det_e is not None:
+                        output_str += f"  Determinant: {det_e:.4e}\n"
+                    if svd_vals_e is not None:
+                        output_str += f"  Singular Values: {np.array2string(svd_vals_e)}\n"
+                    if svd_count_e is not None:
+                        output_str += f"  Non-Zero Singular Values (>1e-6): {svd_count_e} / 3\n"
+                else:
+                    output_str += "Not computed or failed."
+        
+                output_str += "\n"
+                r_mat = results.get("Rotation Matrix")
+                output_str += "Rotation Matrix (R):\n" + (np.array2string(
+                    r_mat) if r_mat is not None else "Not computed or failed.") + "\n\n"
+                t_vec = results.get("Translation Vector")
+                output_str += "Translation Vector (T):\n" + (np.array2string(
+                    t_vec) if t_vec is not None else "Not computed or failed.") + "\n"
+        
+            output_str += "\n-------------------------------\nSUCCESS: Stereo geometry estimation complete.\n"
+        
+            if self.stereo_geometry_output_text:
+                self.stereo_geometry_output_text.insert(tk.END, output_str)
+                self.stereo_geometry_output_text.see(tk.END)
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showinfo(
+                "Success", "Stereo geometry estimation complete.")
+        
+        else:
+            err_msg = f"Unexpected geometry result type: {type(results)}. Content: {results}"
+            print(f"Error: {err_msg}")
+        
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Error", err_msg)
+            self.stereo_geometry_results = {"Error": err_msg}
+
+    # 5. Triangulation (Feature-Based)
+
+    def run_triangulation_and_reconstruction_threaded(self):
+        if self.triangulation_output_text:
+            self.triangulation_output_text.delete(1.0, tk.END)
+        else:
+            print("Warning: triangulation_output_text not initialized.")
+            return
+        
+        if not self.cam_calib_results or "Error" in self.cam_calib_results:
+            messagebox.showerror(
+                "Missing Data", "Run Camera Calibration (Tab 1) successfully first.")
+            return
+        
+        if not self.feat_detect_match_results or "Error" in self.feat_detect_match_results:
+            messagebox.showerror(
+                "Missing Data", "Run Feature Detection & Matching (Tab 3) successfully first.")
+            return
+        
+        pts1 = self.feat_detect_match_results.get("Left Aligned Keypoints")
+        pts2 = self.feat_detect_match_results.get("Right Aligned Keypoints")
+        
+        camera_matrix = self.cam_calib_results.get("Camera Matrix")
+        rotation_matrix = self.feat_detect_match_results.get("Rotation Matrix")
+        translation_vector = self.feat_detect_match_results.get(
+            "Translation Vector")
+        
+        imgL_color = self.feat_detect_match_results.get("Left Color Image")
+        missing = [name for name, var in [
+            ("Left Aligned Keypoints", pts1), ("Right Aligned Keypoints", pts2),
+            ("Camera Matrix", camera_matrix), ("Rotation Matrix", rotation_matrix),
+            ("Translation Vector", translation_vector), ("Left Color Image", imgL_color)
+        ] if var is None]
+        
+        if missing:
+            messagebox.showerror(
+                "Missing Data", f"Could not retrieve the following required data: {', '.join(missing)}")
+            return
+        
+        if not hasattr(self, 'redirector_tri') or not self.redirector_tri:
+            print("Error: redirector_tri not initialized.")
+            return
+        
+        self.redirector_tri.start_redirect()
+        print("Starting Triangulation (Feature-Based)...")
+        print(f"Using {len(pts1)} points for triangulation.")
+        
+        self._run_task_with_loading(
+            task_func=backend.triangulation_and_3D_reconstruction,
+            args=(pts1, pts2, camera_matrix, rotation_matrix,
+                  translation_vector, imgL_color),
+            loading_msg="Triangulating & Visualizing...",
+            result_handler=self._handle_triangulation_result
+        )
+
+    def _handle_triangulation_result(self, results):
+        redirector = getattr(self, 'redirector_tri', None)
+        
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results['Error']
+            print(f"Error: {error_msg}")
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Triangulation Failed", error_msg)
+            self.triangulation_results = results
+        
+        elif isinstance(results, dict) and "3D Points" in results:
+            self.triangulation_results = results
+            num_points = len(results["3D Points"])
+        
+            if self.triangulation_output_text:
+                self.triangulation_output_text.delete(1.0, tk.END)
+        
+            log_msg = (f"SUCCESS: Generated {num_points} 3D points.\n"
+                       f"Attempted to display colored point cloud in Open3D window.\n")
+        
+            if self.triangulation_output_text:
+                self.triangulation_output_text.insert(tk.END, log_msg)
+                self.triangulation_output_text.see(tk.END)
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showinfo(
+                "Success", f"Triangulation successful ({num_points} points).\nCheck Open3D window (if backend opened one).")
+        
+        else:
+            err_msg = f"Unexpected result from triangulation: {type(results)}. Content: {results}"
+            print(err_msg)
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Error", err_msg)
+            self.triangulation_results = {"Error": err_msg}
+
+    # --- DISPARITY TAB ACTIONS ---
+    # 6a. Disparity Calculation
+
+    def run_disparity_calculation_threaded(self):
+        if self.disparity_output_text:
+            self.disparity_output_text.delete(1.0, tk.END)
+        else:
+            print("Warning: disparity_output_text not initialized.")
+            return
+    
+        self._display_image(self.disparity_img_label, None)
+    
+        if not self.stereo_rect_results or "Error" in self.stereo_rect_results:
+            messagebox.showerror(
+                "Missing Data", "Run 'Stereo Rectification' (Tab 2) successfully first.")
+            return
+        imgL_rect_gray = self.stereo_rect_results.get("Rectified Left")
+        imgR_rect_gray = self.stereo_rect_results.get("Rectified Right")
+        imgL_rect_color = self.stereo_rect_results.get("Rectified Color Left")
+    
+        imgL_for_disp = imgL_rect_gray if imgL_rect_gray is not None else imgL_rect_color
+        imgR_for_disp = imgR_rect_gray if imgR_rect_gray is not None else self.stereo_rect_results.get(
+            "Rectified Color Right")
+    
+        if imgL_for_disp is None or imgR_for_disp is None:
+            messagebox.showerror(
+                "Missing Data", "Rectified images not found in Tab 2 results.")
+            return
+    
+        guide_image = imgL_rect_color if imgL_rect_color is not None else imgL_for_disp
+    
+        print("Starting Disparity Calculation (SGBM + WLS)... (Output to console)")
+    
+        self._run_task_with_loading(
+            task_func=backend.disparity_calculation,
+            args=(imgL_for_disp, imgR_for_disp),
+            kwargs={'guide_image': guide_image},
+            loading_msg="Calculating Disparity...",
+            result_handler=self._handle_disparity_result
+        )
+
+    # 6a. Handler
+    def _handle_disparity_result(self, results):
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results['Error']
+            print(f"Error: {error_msg}")
+    
+            if self.disparity_output_text:
+                self.disparity_output_text.insert(
+                    tk.END, f"ERROR: {error_msg}\n")
+                self.disparity_output_text.see(tk.END)
+    
+            messagebox.showerror("Disparity Failed", error_msg)
+            self.disparity_calculation_results = results
+    
+        elif isinstance(results, dict) and "Disparity Map Color" in results:
+            self.disparity_calculation_results = results
+            disparity_map_vis = results.get("Disparity Map Color")
+            print("Success. Displaying filtered disparity heatmap.")
+    
+            if self.disparity_output_text:
+                self.disparity_output_text.insert(
+                    tk.END, "SUCCESS: Disparity map calculated and filtered.\n")
+                self.disparity_output_text.see(tk.END)
+    
+            if disparity_map_vis is not None:
+                fixed_size = (640, 480)
+                try:
+                    self._display_image(self.disparity_img_label, cv2.resize(
+                        disparity_map_vis, fixed_size, interpolation=cv2.INTER_AREA))
+                except Exception as e:
+                    print(f"Error resizing/displaying disparity map: {e}")
+                    self._display_image(self.disparity_img_label, None)
+    
+            else:
+                print("Warning: Disparity Map Color image not found in results.")
+                self._display_image(self.disparity_img_label, None)
+            messagebox.showinfo(
+                "Success", "Disparity map calculated and filtered.")
+    
+        else:
+            err_msg = f"Unknown result from disparity calculation: {type(results)}. Content: {results}"
+            print(err_msg)
+            if self.disparity_output_text:
+                self.disparity_output_text.insert(
+                    tk.END, f"ERROR: {err_msg}\n")
+                self.disparity_output_text.see(tk.END)
+            messagebox.showerror("Error", err_msg)
+            self.disparity_calculation_results = {"Error": err_msg}
+
+    # 6b. Visualize 3D
+    def run_visualize_3d_threaded(self):
+        if self.disparity_output_text:
+            self.disparity_output_text.delete(1.0, tk.END)
+        else:
+            print("Warning: disparity_output_text not initialized.")
+            return
+    
+        if not self.disparity_calculation_results or "Error" in self.disparity_calculation_results:
+            messagebox.showerror(
+                "Missing Data", "Run 'Run Disparity' successfully first on this tab.")
+            return
+    
+        if not self.stereo_rect_results or "Error" in self.stereo_rect_results:
+            messagebox.showerror(
+                "Missing Data", "Run 'Stereo Rectification' (Tab 2) successfully first.")
+            return
+    
+        raw_disparity_map = self.disparity_calculation_results.get(
+            "Raw Disparity")
+        Q = self.stereo_rect_results.get("disp2depth map")
+    
+        colors = self.stereo_rect_results.get("Rectified Color Left")
+        missing = [name for name, var in [
+            ("Raw Disparity Map", raw_disparity_map),
+            ("Q Matrix (disp2depth)", Q),
+            ("Rectified Left Color Image", colors)
+        ] if var is None]
+    
+        if missing:
+            messagebox.showerror(
+                "Missing Data", f"Could not retrieve the following required data: {', '.join(missing)}")
+            return
+    
+        print("Starting 3D Visualization from Dense Disparity... (Output to console)")
+    
+        self._run_task_with_loading(
+            task_func=backend.visualize_point_cloud_disparity,
+            args=(raw_disparity_map, Q, colors),
+            loading_msg="Generating & Visualizing 3D Cloud...",
+            result_handler=self._handle_visualize_3d_result
+        )
+
+    # 6b. Handler
+    def _handle_visualize_3d_result(self, error_message):
+        if error_message:
+            print(f"Error: {error_message}")
+            if self.disparity_output_text:
+                self.disparity_output_text.insert(
+                    tk.END, f"ERROR: {error_message}\n")
+                self.disparity_output_text.see(tk.END)
+            messagebox.showerror("Visualization Failed", error_message)
+    
+        else:
+            print("Point cloud display attempted.")
+            if self.disparity_output_text:
+                self.disparity_output_text.insert(
+                    tk.END, "SUCCESS: Point cloud display attempted.\n")
+                self.disparity_output_text.see(tk.END)
+
+    # --- XFeat Actions ---
+    # 7a. XFeat Matching Action
+
+    def run_sparse_xfeat_matching_threaded(self):
+        if self.sparse_xfeat_output_text:
+            self.sparse_xfeat_output_text.delete(1.0, tk.END)
+        else:
+            print("Warning: sparse_xfeat_output_text not initialized.")
             return
 
-        # Display the number of points generated
-        points_3d = self.triangulation_results["3D Points"]
-        self.triangulation_output_text.insert(tk.END, f"Generated {len(points_3d)} 3D points.\n")
-        self.triangulation_output_text.insert(tk.END, "Point cloud displayed in Open3D window.\n")
+        self._display_image(self.sparse_xfeat_match_label, None)
+        self.sparse_xfeat_results = {}  # Reset state
+        folder_path = self.sparse_xfeat_path_entry.get()
 
-    def feat_detect_match_browse_folder(self):
-        folder = filedialog.askdirectory(title="Select Folder with Image Pair")
+        if not folder_path or not os.path.isdir(folder_path):
+            messagebox.showerror(
+                "Error", "Please select a valid stereo pair folder path.")
+            return
+
+        redirector = getattr(self, 'redirector_xfeat', None)
+
+        if not redirector:
+            print("Error: redirector_xfeat not initialized.")
+            return
+
+        redirector.start_redirect()
+        print(f"Starting XFeat Matching: {folder_path}")
+
+        self._run_task_with_loading(
+            task_func=backend.xfeat_matching,
+            args=(folder_path,),
+            loading_msg="Running XFeat Matching...",
+            result_handler=self._handle_sparse_xfeat_matching_result
+        )
+
+    # 7a. XFeat Matching Handler
+    def _handle_sparse_xfeat_matching_result(self, results):
+        redirector = getattr(self, 'redirector_xfeat', None)
+
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results['Error']
+            print(f"Error: {error_msg}")
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("XFeat Matching Failed", error_msg)
+            self.sparse_xfeat_results = results
+
+        elif isinstance(results, dict) and "Matched Image" in results:
+            # Store results needed for reconstruction
+            self.sparse_xfeat_results = {
+                "mkpts_0": results.get("mkpts_0"),
+                "mkpts_1": results.get("mkpts_1"),
+                "Left Color Image": results.get("Left Color Image"),
+                "Num Matches": results.get("Num Matches"),
+            }
+
+            if self.sparse_xfeat_output_text:
+                self.sparse_xfeat_output_text.delete(1.0, tk.END)
+            num_matches = self.sparse_xfeat_results.get("Num Matches", "N/A")
+            summary = (f"--- XFeat Matching Summary ---\n"
+                       f"Raw XFeat Matches Found: {num_matches}\n"
+                       f"------------------------------------\n"
+                       f"SUCCESS: XFeat matching complete.\n"
+                       f"Ready for 3D Reconstruction (Button 2).\n")
+            if self.sparse_xfeat_output_text:
+                self.sparse_xfeat_output_text.insert(tk.END, summary)
+                self.sparse_xfeat_output_text.see(tk.END)
+            if redirector:
+                redirector.stop_redirect()
+
+            
+            match_img = results.get("Matched Image")
+            if match_img is not None:
+                fixed_size = (1280, 480) 
+                try:
+                    self._display_image(self.sparse_xfeat_match_label, cv2.resize(
+                        match_img, fixed_size, interpolation=cv2.INTER_AREA))
+                except Exception as e:
+                    print(
+                        f"Error resizing/displaying XFeat matched image: {e}")
+                    self._display_image(self.sparse_xfeat_match_label, None)
+        
+            else:
+                print("Warning: XFeat Matched Image not found in results.")
+                self._display_image(self.sparse_xfeat_match_label, None)
+
+            messagebox.showinfo(
+                "Success", f"XFeat matching complete ({num_matches} matches).\nReady for 3D Reconstruction.")
+        
+        else:
+            err_msg = f"Unexpected XFeat matching result type: {type(results)}. Content: {results}"
+            print(err_msg)
+        
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("Error", err_msg)
+            self.sparse_xfeat_results = {"Error": err_msg}
+
+    # 7b. XFeat Reconstruction Action
+    def run_sparse_xfeat_reconstruction_threaded(self):
+    
+        redirector = getattr(self, 'redirector_xfeat', None)
+    
+        if not redirector:
+            print("Error: redirector_xfeat not initialized.")
+            return
+    
+        if not self.sparse_xfeat_results or "Error" in self.sparse_xfeat_results or \
+           self.sparse_xfeat_results.get("mkpts_0") is None or \
+           self.sparse_xfeat_results.get("mkpts_1") is None or \
+           self.sparse_xfeat_results.get("Left Color Image") is None:
+            messagebox.showerror(
+                "Missing Data", "Run '1. Run XFeat Matching' successfully first on this tab.")
+            return
+    
+        if not self.cam_calib_results or "Error" in self.cam_calib_results or \
+           self.cam_calib_results.get("Camera Matrix") is None:
+            messagebox.showerror(
+                "Missing Data", "Run Camera Calibration (Tab 1) successfully first (provides K).")
+            return
+    
+        if not self.feat_detect_match_results or "Error" in self.feat_detect_match_results or \
+           self.feat_detect_match_results.get("Rotation Matrix") is None or \
+           self.feat_detect_match_results.get("Translation Vector") is None:
+            messagebox.showerror(
+                "Missing Data", "Run Feature Detection & Matching (Tab 3) successfully first (provides R, T).")
+            return
+    
+        pts1 = self.sparse_xfeat_results.get("mkpts_0")
+        pts2 = self.sparse_xfeat_results.get("mkpts_1")
+    
+        imgL_color = self.sparse_xfeat_results.get("Left Color Image")
+        camera_matrix = self.cam_calib_results.get("Camera Matrix")
+        rotation_matrix = self.feat_detect_match_results.get("Rotation Matrix")
+        translation_vector = self.feat_detect_match_results.get(
+            "Translation Vector")
+    
+        if pts1 is None or pts2 is None or imgL_color is None or \
+           camera_matrix is None or rotation_matrix is None or translation_vector is None:
+            messagebox.showerror(
+                "Internal Error", "Failed to retrieve required data for reconstruction.")
+            return
+    
+        redirector.start_redirect()
+        print("\n--- Starting XFeat 3D Reconstruction ---")
+        print(f"Using {len(pts1)} points from XFeat matching.")
+        print("Using K from Tab 1 and R, T from Tab 3.")
+    
+        self._run_task_with_loading(
+            task_func=backend.xfeat_reconstruction,
+            args=(pts1, pts2, camera_matrix, rotation_matrix,
+                  translation_vector, imgL_color),
+            loading_msg="Running XFeat 3D Reconstruction...",
+            result_handler=self._handle_sparse_xfeat_reconstruction_result
+        )
+
+    # 7b. XFeat Reconstruction Handler
+    def _handle_sparse_xfeat_reconstruction_result(self, results):
+    
+        redirector = getattr(self, 'redirector_xfeat', None)
+    
+        if isinstance(results, dict) and "Error" in results:
+            error_msg = results['Error']
+            print(f"Error: {error_msg}")
+    
+            if redirector:
+                redirector.stop_redirect()
+            messagebox.showerror("XFeat Reconstruction Failed", error_msg)
+    
+            if "Reconstruction Error" not in self.sparse_xfeat_results:
+                self.sparse_xfeat_results["Reconstruction Error"] = error_msg
+    
+        elif isinstance(results, dict) and "Num 3D Points" in results:
+            num_3d = results.get("Num 3D Points", "N/A")
+            vis_error = results.get("Visualization Error")
+            summary = (f"\n--- XFeat Reconstruction Summary ---\n"
+                       f"Filtered 3D Points Generated: {num_3d}\n")
+    
+            if vis_error:
+                summary += f"WARNING: Point cloud visualization failed:\n{vis_error}\n"
+            else:
+                summary += f"Point cloud display attempted (check Open3D window).\n"
+    
+            summary += "------------------------------------\n"
+            summary += "SUCCESS: XFeat 3D reconstruction complete.\n"
+    
+            if self.sparse_xfeat_output_text:
+                self.sparse_xfeat_output_text.insert(tk.END, summary)
+                self.sparse_xfeat_output_text.see(tk.END)
+            if redirector:
+                redirector.stop_redirect()
+    
+            self.sparse_xfeat_results["3D Points"] = results.get("3D Points")
+            self.sparse_xfeat_results["Num 3D Points"] = num_3d
+    
+            if vis_error:
+                self.sparse_xfeat_results["Visualization Error"] = vis_error
+            msg = f"XFeat reconstruction complete.\nGenerated {num_3d} 3D points."
+    
+            if vis_error:
+                msg += f"\n\nNote: {vis_error}"
+            else:
+                msg += "\nCheck Open3D window (if backend opened one)."
+            messagebox.showinfo("Success", msg)
+    
+        else:
+            err_msg = f"Unexpected XFeat reconstruction result type: {type(results)}. Content: {results}"
+            print(err_msg)
+            if redirector:
+                redirector.stop_redirect()
+    
+            messagebox.showerror("Error", err_msg)
+            if "Reconstruction Error" not in self.sparse_xfeat_results:
+                self.sparse_xfeat_results["Reconstruction Error"] = err_msg
+
+    # --- Browse Methods ---
+    def _set_path_entry(self, entry_widget, folder_path):
+        if entry_widget:
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, folder_path)
+        else:
+            print("Warning: Tried to set path for a non-existent widget.")
+
+    def _auto_populate_paths(self, selected_folder):
+        path_entries = [
+            self.stereo_rect_path_entry,
+            self.feat_detect_match_path_entry,
+            self.stereo_geometry_estimation_path_entry,
+            self.sparse_xfeat_path_entry
+        ]
+        for entry in path_entries:
+            if entry and not entry.get():
+                self._set_path_entry(entry, selected_folder)
+
+    def cam_calib_browse_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select Folder with Chessboard Images (*.jpg)")
         if folder:
-            self.feat_detect_match_path_entry.delete(0, tk.END)
-            self.feat_detect_match_path_entry.insert(0, folder)
+            self._set_path_entry(self.cam_calib_path_entry, folder)
 
     def stereo_rect_browse_folder(self):
-        folder = filedialog.askdirectory(title="Select Folder with Stereo Image Pairs")
+        folder = filedialog.askdirectory(
+            title="Select Folder with img1.jpg and img2.jpg")
         if folder:
-            self.stereo_rect_path_entry.delete(0, tk.END)
-            self.stereo_rect_path_entry.insert(0, folder)
+            self._set_path_entry(self.stereo_rect_path_entry, folder)
+            self._auto_populate_paths(folder)
+
+    def feat_detect_match_browse_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select Folder with img1.jpg and img2.jpg")
+        if folder:
+            self._set_path_entry(self.feat_detect_match_path_entry, folder)
+            self._auto_populate_paths(folder)
 
     def stereo_geometry_estimation_browse_folder(self):
-        folder = filedialog.askdirectory(title="Select Folder with Stereo Image Pairs")
+        folder = filedialog.askdirectory(
+            title="Select Folder with img1.jpg and img2.jpg")
         if folder:
-            self.stereo_geometry_estimation_path_entry.delete(0, tk.END)
-            self.stereo_geometry_estimation_path_entry.insert(0, folder)
+            self._set_path_entry(
+                self.stereo_geometry_estimation_path_entry, folder)
+            self._auto_populate_paths(folder)
+
+    def sparse_xfeat_browse_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select Folder with img1.jpg and img2.jpg")
+        if folder:
+            self._set_path_entry(self.sparse_xfeat_path_entry, folder)
+            self._auto_populate_paths(folder)
+
 
 # Run the application
 if __name__ == "__main__":
