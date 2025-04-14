@@ -7,7 +7,10 @@ import torch
 from modules.xfeat import XFeat
 
 # --- Camera Calibration Function ---
-def cam_calib(base_path):
+def cam_calib(base_path, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     checkerboardsize = (9, 7)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     objp = np.zeros((checkerboardsize[0] * checkerboardsize[1], 3), np.float32)
@@ -23,6 +26,9 @@ def cam_calib(base_path):
     print(f"Found {len(images)} images for calibration.")
     processed_count = 0
     for fname in images:
+        if cancel_event and cancel_event.is_set():
+            return {"Error": "Task canceled by user."}
+        
         img = cv2.imread(fname)
         if img is None:
             print(f"Warning: Could not read image {fname}. Skipping.")
@@ -47,6 +53,10 @@ def cam_calib(base_path):
         return {"Error": "Could not read shape from any image."}
     print(
         f"Calibrating using {len(objpoints)} images (out of {processed_count} processed) with shape {gray_shape}.")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     try:
         ret, cameraMatrix, dist, rvecs, tvecs = cv2.calibrateCamera(
             objpoints, imgpoints, gray_shape, None, None, flags=cv2.CALIB_RATIONAL_MODEL)
@@ -57,6 +67,9 @@ def cam_calib(base_path):
 
     reprojection_error = 0
     for i in range(len(objpoints)):
+        if cancel_event and cancel_event.is_set():
+            return {"Error": "Task canceled by user."}
+        
         imgpoints2, _ = cv2.projectPoints(
             objpoints[i], rvecs[i], tvecs[i], cameraMatrix, dist)
         error = cv2.norm(imgpoints[i], imgpoints2,
@@ -67,7 +80,10 @@ def cam_calib(base_path):
     return {"Camera Matrix": cameraMatrix, "Distortion Parameters": dist, "Reprojection Error": mean_error}
 
 # --- Draw Epipolar Lines Function ---
-def draw_epilines(img1, img2, lines, pts1, pts2):
+def draw_epilines(img1, img2, lines, pts1, pts2, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return img1, img2  # Return unmodified images if canceled
+    
     if len(img1.shape) == 3:
         img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     else:
@@ -83,9 +99,11 @@ def draw_epilines(img1, img2, lines, pts1, pts2):
     pts2 = np.int32(pts2.reshape(-1, 2))
     lines = lines.reshape(-1, 3)
     for r_line, pt1, pt2 in zip(lines, pts1, pts2):
+        if cancel_event and cancel_event.is_set():
+            return img1_color, img2_color
+        
         color = tuple(np.random.randint(0, 255, 3).tolist())
-        # Calculate line endpoints carefully to avoid division by zero
-        if abs(r_line[1]) > 1e-6:  # If line is not horizontal
+        if abs(r_line[1]) > 1e-6:
             y0 = -r_line[2] / r_line[1]
             y1 = -(r_line[2] + r_line[0] * c) / r_line[1]
             x0, x1 = 0, c
@@ -101,13 +119,10 @@ def draw_epilines(img1, img2, lines, pts1, pts2):
         x0, y0, x1, y1 = map(int, [x0, y0, x1, y1])
 
         try:
-            # Use cv2.clipLine to ensure endpoints are within image bounds
             ret, p1_clip, p2_clip = cv2.clipLine(
                 (0, 0, c, r), (x0, y0), (x1, y1))
             if ret:
                 img1_color = cv2.line(img1_color, p1_clip, p2_clip, color, 1)
-            else:
-                pass
         except OverflowError:
             print(
                 f"Warning: Overflow drawing line segment ({x0},{y0}) to ({x1},{y1}). Skipping.")
@@ -123,7 +138,10 @@ def draw_epilines(img1, img2, lines, pts1, pts2):
     return img1_color, img2_color
 
 # --- Stereo Rectification Function ---
-def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
+def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     print("--- Stereo Rectification ---")
     if cameraMatrix is None:
         cameraMatrix = np.array(
@@ -147,6 +165,9 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
     if imgL_color is None or imgR_color is None:
         return {"Error": "Failed to load images."}
     
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     imgL = cv2.cvtColor(imgL_color, cv2.COLOR_BGR2GRAY)
     imgR = cv2.cvtColor(imgR_color, cv2.COLOR_BGR2GRAY)
     h, w = imgL.shape[:2]
@@ -159,6 +180,9 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
     if descriptors_left is None or descriptors_right is None or len(descriptors_left) < 8 or len(descriptors_right) < 8:
         return {"Error": "Not enough keypoints found (need at least 8)."}
     
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     FLANN_INDEX_KDTREE = 1
     index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
     search_params = dict(checks=50)
@@ -168,6 +192,8 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
     
     if matches is not None:
         for pair in matches:
+            if cancel_event and cancel_event.is_set():
+                return {"Error": "Task canceled by user."}
             if len(pair) == 2 and pair[0].distance < 0.7 * pair[1].distance:
                 good_matches.append(pair[0])
     if len(good_matches) < 8:
@@ -195,6 +221,9 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
     if R_rect is None or T_vec is None:
         return {"Error": "Could not recover pose (R, T) from Essential Matrix."}
     
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     F, mask_f = cv2.findFundamentalMat(pts_left, pts_right, cv2.FM_LMEDS)
     imgL_before_rec = imgL_color.copy()
     imgR_before_rec = imgR_color.copy()
@@ -208,12 +237,12 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
                     pts_right_in_f.reshape(-1, 1, 2), 2, F)
                 lines_left = lines_left.reshape(-1, 3)
                 imgL_before_rec, _ = draw_epilines(
-                    imgL_before_rec, imgR_before_rec, lines_left, pts_left_in_f, pts_right_in_f)
+                    imgL_before_rec, imgR_before_rec, lines_left, pts_left_in_f, pts_right_in_f, cancel_event)
                 lines_right = cv2.computeCorrespondEpilines(
                     pts_left_in_f.reshape(-1, 1, 2), 1, F)
                 lines_right = lines_right.reshape(-1, 3)
                 imgR_before_rec, _ = draw_epilines(
-                    imgR_before_rec, imgL_before_rec, lines_right, pts_right_in_f, pts_left_in_f)
+                    imgR_before_rec, imgL_before_rec, lines_right, pts_right_in_f, pts_left_in_f, cancel_event)
             except Exception as e:
                 print(
                     f"Warning: Could not draw epilines before rectification: {e}")
@@ -230,6 +259,9 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
         return {"Error": f"Stereo rectification failed with exception: {e}"}
 
     print("Q matrix (Disparity-to-depth) calculated.")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
     
     mapL1, mapL2 = cv2.initUndistortRectifyMap(
         K, distCoeffs_rect, R1, P1, image_size, cv2.CV_32FC1)
@@ -258,6 +290,8 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
         good_matches_rect = []
         if matches_rect:
             for pair in matches_rect:
+                if cancel_event and cancel_event.is_set():
+                    return {"Error": "Task canceled by user."}
                 if len(pair) == 2 and pair[0].distance < 0.7 * pair[1].distance:
                     good_matches_rect.append(pair[0])
         if len(good_matches_rect) > 8:
@@ -280,13 +314,13 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
                             pts_right_rect_in.reshape(-1, 1, 2), 2, F_rect)
                         lines_left_rect = lines_left_rect.reshape(-1, 3)
                         imgL_after_rec, _ = draw_epilines(
-                            imgL_after_rec, imgR_after_rec, lines_left_rect, pts_left_rect_in, pts_right_rect_in)
+                            imgL_after_rec, imgR_after_rec, lines_left_rect, pts_left_rect_in, pts_right_rect_in, cancel_event)
     
                         lines_right_rect = cv2.computeCorrespondEpilines(
                             pts_left_rect_in.reshape(-1, 1, 2), 1, F_rect)
                         lines_right_rect = lines_right_rect.reshape(-1, 3)
                         imgR_after_rec, _ = draw_epilines(
-                            imgR_after_rec, imgL_after_rec, lines_right_rect, pts_right_rect_in, pts_left_rect_in)
+                            imgR_after_rec, imgL_after_rec, lines_right_rect, pts_right_rect_in, pts_left_rect_in, cancel_event)
                     except Exception as e:
                         print(
                             f"Warning: Could not draw epilines after rectification: {e}")
@@ -297,9 +331,11 @@ def stereo_rect(stereo_path, cameraMatrix=None, distCoeffs=None):
             "Rectified Color Left": imgL_rect_color, "Rectified Color Right": imgR_rect_color,
             "disp2depth map": Q}
 
-
 # --- Feature Detection and Matching Function ---
-def feat_detect_match(stereo_path, cameraMatrix=None):
+def feat_detect_match(stereo_path, cameraMatrix=None, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     print("--- Feature Detection & Matching ---")
     if cameraMatrix is None:
         cameraMatrix = np.array(
@@ -316,6 +352,10 @@ def feat_detect_match(stereo_path, cameraMatrix=None):
     imgR_color = cv2.imread(right_image_path)
     if imgL_color is None or imgR_color is None:
         return {"Error": "Failed to load images."}
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     imgL = cv2.cvtColor(imgL_color, cv2.COLOR_BGR2GRAY)
     imgR = cv2.cvtColor(imgR_color, cv2.COLOR_BGR2GRAY)
     keypoints_left, descriptors_left = sift.detectAndCompute(imgL, None)
@@ -325,6 +365,10 @@ def feat_detect_match(stereo_path, cameraMatrix=None):
     if descriptors_left is None or descriptors_right is None or num_kp_left < 8 or num_kp_right < 8:
         return {"Error": "Not enough keypoints found (need at least 8)."}
     print(f"SIFT: {num_kp_left} kp left, {num_kp_right} kp right.")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     FLANN_INDEX_KDTREE = 1
     index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
     search_params = dict(checks=50)
@@ -339,6 +383,8 @@ def feat_detect_match(stereo_path, cameraMatrix=None):
     pts2_list = []
     matches_viz = []
     for i, pair in enumerate(matches):
+        if cancel_event and cancel_event.is_set():
+            return {"Error": "Task canceled by user."}
         if len(pair) == 2:
             m, n = pair
             matches_viz.append([m])
@@ -361,10 +407,14 @@ def feat_detect_match(stereo_path, cameraMatrix=None):
     else:
         print(
             f"Fundamental Matrix inliers: {np.sum(mask_f) if mask_f is not None else 'N/A'}")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     K = np.array(cameraMatrix)
     E, mask_e = cv2.findEssentialMat(
         pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-    R, t_vec = np.eye(3), np.zeros((3, 1))  # Initialize defaults
+    R, t_vec = np.eye(3), np.zeros((3, 1))
     if E is None:
         print("Warning: Essential Matrix calculation failed. Using identity pose.")
     elif mask_e is None:
@@ -413,7 +463,10 @@ def feat_detect_match(stereo_path, cameraMatrix=None):
             }
 
 # --- Stereo Geometry Estimation Function ---
-def stereo_geometry_estimation(stereo_path, cameraMatrix=None):
+def stereo_geometry_estimation(stereo_path, cameraMatrix=None, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     print("--- Stereo Geometry Estimation ---")
     if cameraMatrix is None:
         cameraMatrix = np.array(
@@ -427,11 +480,19 @@ def stereo_geometry_estimation(stereo_path, cameraMatrix=None):
     imgR = cv2.imread(right_image_path, cv2.IMREAD_GRAYSCALE)
     if imgL is None or imgR is None:
         return {"Error": "Failed to load images."}
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     sift = cv2.SIFT_create()
     keypoints_left, descriptors_left = sift.detectAndCompute(imgL, None)
     keypoints_right, descriptors_right = sift.detectAndCompute(imgR, None)
     if descriptors_left is None or descriptors_right is None or len(descriptors_left) < 8 or len(descriptors_right) < 8:
         return {"Error": "Not enough keypoints found (need at least 8)."}
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     FLANN_INDEX_KDTREE = 1
     index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
     search_params = dict(checks=50)
@@ -443,6 +504,8 @@ def stereo_geometry_estimation(stereo_path, cameraMatrix=None):
     pts_left_list = []
     pts_right_list = []
     for pair in matches:
+        if cancel_event and cancel_event.is_set():
+            return {"Error": "Task canceled by user."}
         if len(pair) == 2 and pair[0].distance < 0.7 * pair[1].distance:
             good_matches.append(pair[0])
             pts_left_list.append(keypoints_left[pair[0].queryIdx].pt)
@@ -505,7 +568,10 @@ def stereo_geometry_estimation(stereo_path, cameraMatrix=None):
             "Rotation Matrix": R, "Translation Vector": T_vec}
 
 # --- Triangulation Function (Feature-Based SIFT) ---
-def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVector, imgL_color):
+def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVector, imgL_color, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     if pts1 is None or pts2 is None or len(pts1) == 0 or len(pts2) == 0 or len(pts1) != len(pts2):
         return {"Error": "Invalid or mismatched keypoints."}
     if cameraMatrix is None or rotationMatrix is None or translationVector is None:
@@ -518,6 +584,10 @@ def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix
     P1 = cameraMatrix @ np.hstack((np.eye(3), np.zeros((3, 1))))
     P2 = cameraMatrix @ np.hstack((rotationMatrix, translationVector))
     print("Triangulating points...")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     try:
         points_4d_hom = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
     except Exception as e:
@@ -527,12 +597,10 @@ def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix
     if not np.any(valid_4d_mask):
         return {"Error": "Triangulation resulted in invalid homogeneous coordinates (all W near zero)."}
     points_4d_hom_valid = points_4d_hom[:, valid_4d_mask]
-    # Keep track of corresponding 2D points
     pts1_valid_4d = pts1[valid_4d_mask]
     points_3d = points_4d_hom_valid[:3] / points_4d_hom_valid[3]
     points_3d = points_3d.T
 
-    # Filter points based on positive depth in both cameras and reasonable max depth
     points_3d_cam1 = points_3d
     points_3d_cam2 = (rotationMatrix @ points_3d.T + translationVector).T
     filter_z_max = 1000.0 
@@ -542,15 +610,15 @@ def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix
                      pts1_valid_4d[:, 1] < img_height)
 
     points_3d_filtered = points_3d[valid_mask]
-    pts1_filtered = pts1_valid_4d[valid_mask]  # Filter corresponding 2D points
+    pts1_filtered = pts1_valid_4d[valid_mask]
     print(f"Triangulation: {len(points_4d_hom.T)} points initially -> {np.sum(valid_4d_mask)} with valid W -> {len(points_3d_filtered)} points after Z/bounds filtering.")
     if len(points_3d_filtered) == 0:
         return {"Error": "No valid 3D points generated after filtering."}
 
-    # Extract colors for the *filtered* points using their corresponding *filtered* 2D coordinates
     colors_bgr = []
     for pt in pts1_filtered:
-        # Clip coordinates to be within image bounds before accessing pixel
+        if cancel_event and cancel_event.is_set():
+            return {"Error": "Task canceled by user."}
         x, y = np.clip(np.int32(np.round(pt)), [0, 0], [
                        img_width - 1, img_height - 1])
         colors_bgr.append(imgL_color[y, x])
@@ -558,11 +626,9 @@ def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix
     if colors_bgr.shape[0] != points_3d_filtered.shape[0]:
         print(
             f"Warning: Color array size mismatch ({colors_bgr.shape[0]}) vs points ({points_3d_filtered.shape[0]}). Check filtering logic.")
-        # Fallback: create gray colors or skip coloring
         colors_rgb_normalized = np.full(
-            (len(points_3d_filtered), 3), 0.5)  # Gray
+            (len(points_3d_filtered), 3), 0.5)
     else:
-        # BGR to RGB and normalize
         colors_rgb_normalized = colors_bgr[:, ::-1] / 255.0
 
     pcd = o3d.geometry.PointCloud()
@@ -573,6 +639,10 @@ def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix
         print("Warning: Color array size mismatch persists. Point cloud will be uncolored.")
 
     print("Displaying *colored* point cloud in Open3D window...")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     try:
         o3d.visualization.draw_geometries(
             [pcd], window_name="Triangulated Point Cloud (SIFT/ORB etc.)")
@@ -583,10 +653,11 @@ def triangulation_and_3D_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix
 
     return {"3D Points": points_3d_filtered}
 
-
 # --- Disparity Calculation Function ---
-def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
-    """Calculates disparity map using StereoSGBM and WLS filter."""
+def disparity_calculation(imgL_rect, imgR_rect, guide_image=None, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     print("--- Disparity Calculation using SGBM + WLS ---")
     if imgL_rect is None or imgR_rect is None:
         return {"Error": "Rectified images not provided."}
@@ -618,7 +689,6 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
             f"Warning: Unexpected guide image format: {guide_image_wls.shape}. Using left grayscale image as guide.")
         guide_for_filter = left_gray
     img_width = left_gray.shape[1]
-    # --- SGBM Parameters ---
     num_disparities = ((270 // 16) + 1) * 16 
     if num_disparities > img_width:
         print(
@@ -634,10 +704,14 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
     speckle_range = 2
     mode = cv2.STEREO_SGBM_MODE_SGBM_3WAY
 
-    print(f"SGBM Params: minD={min_disparity}, numD={num_disparities}, blockS={block_size}, P1={P1}, P2={P2}, uniqueR={uniqueness_ratio}, speckleWin={speckle_window_size}, speckleRng={speckle_range}, disp12MaxD={disp12_max_diff}, mode={mode}")  # Console print
+    print(f"SGBM Params: minD={min_disparity}, numD={num_disparities}, blockS={block_size}, P1={P1}, P2={P2}, uniqueR={uniqueness_ratio}, speckleWin={speckle_window_size}, speckleRng={speckle_range}, disp12MaxD={disp12_max_diff}, mode={mode}")
     stereo_left = cv2.StereoSGBM_create(minDisparity=min_disparity, numDisparities=num_disparities, blockSize=block_size, P1=P1, P2=P2,
                                         disp12MaxDiff=disp12_max_diff, uniquenessRatio=uniqueness_ratio, speckleWindowSize=speckle_window_size, speckleRange=speckle_range, mode=mode)
-    print("Computing left disparity (SGBM)...") 
+    print("Computing left disparity (SGBM)...")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     disparity_left_raw_scaled = stereo_left.compute(left_gray, right_gray)
     if disparity_left_raw_scaled is None:
         return {"Error": "SGBM computation failed (returned None)."}
@@ -646,6 +720,10 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
     print(
         f"Raw SGBM disparity range (scaled int16): min={min_raw_s}, max={max_raw_s}")
     print("Computing right disparity for WLS...")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     try:
         stereo_right = cv2.ximgproc.createRightMatcher(stereo_left)
         disparity_right_raw_scaled = stereo_right.compute(
@@ -656,7 +734,6 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
         return {"Error": f"Failed to create right matcher or compute right disparity: {e}"}
     if disparity_right_raw_scaled is None:
         return {"Error": "Right disparity computation failed (returned None)."}
-    # --- WLS Filter Parameters ---
     lambda_wls = 1000000
     sigma_color_wls = 3
     
@@ -666,6 +743,10 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
     wls_filter.setLambda(lambda_wls)
     wls_filter.setSigmaColor(sigma_color_wls)
     print("Applying WLS filter...")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     try:
         filtered_disparity_scaled = wls_filter.filter(
             disparity_left_raw_scaled, guide_for_filter, disparity_map_right=disparity_right_raw_scaled)
@@ -674,22 +755,19 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
     except Exception as e:
         return {"Error": f"An unexpected error occurred during WLS filtering: {e}"}
     min_filt_s, max_filt_s, _, _ = cv2.minMaxLoc(filtered_disparity_scaled)
-    # Console print
     print(
         f"Filtered disparity range (scaled int16): min={min_filt_s}, max={max_filt_s}")
     filtered_disparity_float = filtered_disparity_scaled.astype(
         np.float32) / 16.0
 
-
     valid_disp_mask = (filtered_disparity_float > min_disparity) & np.isfinite(
-        filtered_disparity_float) 
+        filtered_disparity_float)
     if np.any(valid_disp_mask):
         min_vis_float = np.min(filtered_disparity_float[valid_disp_mask])
         max_vis_float = np.max(filtered_disparity_float[valid_disp_mask])
         print(
             f"Normalization range (float, valid > minD): min={min_vis_float:.2f}, max={max_vis_float:.2f}")
         if max_vis_float > min_vis_float:
-            # Normalize only the valid parts for visualization
             norm_image = np.zeros_like(filtered_disparity_float)
             cv2.normalize(src=filtered_disparity_float, dst=norm_image, alpha=0, beta=255,
                           norm_type=cv2.NORM_MINMAX, mask=valid_disp_mask.astype(np.uint8))
@@ -698,7 +776,6 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
             print("Warning: All valid filtered disparities have the same value.")
             filtered_disparity_vis_gray = np.full_like(
                 left_gray, 128, dtype=np.uint8)
-            # Set invalid to black
             filtered_disparity_vis_gray[~valid_disp_mask] = 0
     else:
         print("Warning: No valid disparities (> min_disparity) found after filtering.")
@@ -707,30 +784,28 @@ def disparity_calculation(imgL_rect, imgR_rect, guide_image=None):
     filtered_disparity_vis_color = cv2.applyColorMap(
         filtered_disparity_vis_gray, cv2.COLORMAP_JET)
     filtered_disparity_vis_color[~valid_disp_mask] = [
-        0, 0, 0]  # Make invalid regions black in color map too
+        0, 0, 0]
 
-    print("Disparity calculation and filtering complete.")  # Console print
+    print("Disparity calculation and filtering complete.")
     return {
-        # Grayscale normalized visualization
         "Disparity Map": filtered_disparity_vis_gray,
-        "Disparity Map Color": filtered_disparity_vis_color,  # Color heatmap visualization
-        # The actual float disparity values (useful for reprojectImageTo3D)
+        "Disparity Map Color": filtered_disparity_vis_color,
         "Raw Disparity": filtered_disparity_float
     }
 
-
 # --- Visualize Point Cloud from Disparity ---
-# (Keep the REVERTED version from the previous response)
-def visualize_point_cloud_disparity(raw_disparity_map, Q, colors):
-    """Reconstructs 3D points from disparity and visualizes with color."""
+def visualize_point_cloud_disparity(raw_disparity_map, Q, colors, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return "Task canceled by user."
+    
     if raw_disparity_map is None or Q is None or colors is None:
         return "Error: Missing raw disparity, Q, or color image for 3D visualization."
-    print("Reprojecting image to 3D...")  # Console print
+    print("Reprojecting image to 3D...")
+    
     try:
         if raw_disparity_map.dtype != np.float32:
             print("Warning: Input disparity map is not float32. Converting.")
             raw_disparity_map = raw_disparity_map.astype(np.float32)
-        # Handle infinite disparities which can cause issues
         raw_disparity_map[raw_disparity_map == np.inf] = 0
         raw_disparity_map[raw_disparity_map == -np.inf] = 0
         points_3D = cv2.reprojectImageTo3D(
@@ -740,11 +815,13 @@ def visualize_point_cloud_disparity(raw_disparity_map, Q, colors):
     h, w = raw_disparity_map.shape
     if points_3D.shape[:2] != (h, w) or colors.shape[:2] != (h, w):
         return f"Shape mismatch after reproject: Disp({h}x{w}), Pts({points_3D.shape}), Color({colors.shape})"
+    
+    if cancel_event and cancel_event.is_set():
+        return "Task canceled by user."
+    
     try:
-        
         min_disp_val = 0.1
-        max_depth_val = 1000.0  # Use large depth limit initially, can be reduced
-        # Mask based on disparity > min, finite 3D coords, and Z coordinate range
+        max_depth_val = 1000.0
         mask = (raw_disparity_map > min_disp_val) & \
             np.isfinite(points_3D).all(axis=2) & \
                (points_3D[:, :, 2] > 0) & \
@@ -770,6 +847,10 @@ def visualize_point_cloud_disparity(raw_disparity_map, Q, colors):
                 f"Warning: Mismatch between points ({valid_points.shape[0]}) and colors ({valid_colors_rgb.shape[0]}) after masking.")
         print(f"Creating point cloud with {len(valid_points)} points.")
         print("Displaying colored point cloud in Open3D window...")
+        
+        if cancel_event and cancel_event.is_set():
+            return "Task canceled by user."
+        
         try:
             o3d.visualization.draw_geometries(
                 [point_cloud], window_name="Dense Point Cloud (Disparity)")
@@ -783,10 +864,11 @@ def visualize_point_cloud_disparity(raw_disparity_map, Q, colors):
         return f"Error during point cloud creation/visualization: {e}"
     return None
 
-
-# --- XFeat Helper Function (warp_corners_and_draw_matches)
-def draw_xfeat_matches(ref_points, dst_points, img1, img2):
-    """Draws keypoints and matches found by XFeat."""
+# --- XFeat Helper Function (warp_corners_and_draw_matches) ---
+def draw_xfeat_matches(ref_points, dst_points, img1, img2, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return cv2.hconcat([img1, img2])
+    
     if ref_points is None or dst_points is None:
         print("Warning: No points provided for drawing matches.")
         return cv2.hconcat([img1, img2])
@@ -795,30 +877,28 @@ def draw_xfeat_matches(ref_points, dst_points, img1, img2):
         print("Warning: Mismatch in number of reference and destination points. Cannot draw matches.")
         return cv2.hconcat([img1, img2])
 
-    # Create KeyPoint objects for all points
     keypoints1 = [cv2.KeyPoint(p[0], p[1], 5) for p in ref_points]
     keypoints2 = [cv2.KeyPoint(p[0], p[1], 5) for p in dst_points]
 
-    # Create DMatch objects for all pairs (index i matches index i)
     matches = [cv2.DMatch(i, i, 0) for i in range(len(ref_points))]
 
-    # Draw all matches
     img_matches = cv2.drawMatches(
         img1, keypoints1,
         img2, keypoints2,
-        matches,  # Draw all matches
+        matches,
         None,
-        matchColor=(0, 255, 0),  # Green lines for matches
-        singlePointColor=(0, 0, 255),  # Red circles for keypoints
+        matchColor=(0, 255, 0),
+        singlePointColor=(0, 0, 255),
         flags=cv2.DrawMatchesFlags_DEFAULT
     )
 
     return img_matches
 
-
 # --- XFeat Matching Function ---
-def xfeat_matching(stereo_path):
-    """Performs XFeat matching and returns points, visualization, and counts."""
+def xfeat_matching(stereo_path, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     print("--- XFeat Matching (Experimental) ---")
 
     left_image_path = os.path.join(stereo_path, "img1.jpg")
@@ -831,7 +911,10 @@ def xfeat_matching(stereo_path):
     imgR_color = cv2.imread(right_image_path)
     if imgL_color is None or imgR_color is None:
         return {"Error": "Failed to load images."}
-
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     try:
         print("Initializing XFeat...")
         xfeat = XFeat()
@@ -850,7 +933,11 @@ def xfeat_matching(stereo_path):
         return {"Error": f"Error during XFeat matching: {e}"}
 
     print("Drawing matches...")
-    canvas = draw_xfeat_matches(mkpts_0, mkpts_1, imgL_color, imgR_color)
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
+    canvas = draw_xfeat_matches(mkpts_0, mkpts_1, imgL_color, imgR_color, cancel_event)
 
     return {
         "mkpts_0": mkpts_0,
@@ -861,10 +948,10 @@ def xfeat_matching(stereo_path):
     }
 
 # --- XFeat Reconstruction Function ---
-
-
-def xfeat_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVector, imgL_color):
-    """Performs triangulation and 3D visualization for XFeat points."""
+def xfeat_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVector, imgL_color, cancel_event=None):
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     print("--- XFeat 3D Reconstruction (Experimental) ---")
 
     if pts1 is None or pts2 is None or len(pts1) == 0 or len(pts2) == 0 or len(pts1) != len(pts2):
@@ -875,10 +962,9 @@ def xfeat_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVe
         return {"Error": "Missing left color image for coloring points."}
 
     img_height, img_width = imgL_color.shape[:2]
-    pts1 = np.float32(pts1).reshape(-1, 2)  # Ensure correct shape/type
+    pts1 = np.float32(pts1).reshape(-1, 2)
     pts2 = np.float32(pts2).reshape(-1, 2)
 
-    # Define projection matrices
     K0 = cameraMatrix
     R = rotationMatrix
     T = translationVector
@@ -886,34 +972,35 @@ def xfeat_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVe
     P2 = K0 @ np.hstack((R, T))
 
     print(f"Triangulating {len(pts1)} points using provided K, R, T...")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     try:
         points_4d_hom = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
     except Exception as e:
         return {"Error": f"cv2.triangulatePoints failed: {e}"}
 
-    # Convert from homogeneous coordinates to 3D and filter
     valid_4d_mask = np.abs(points_4d_hom[3]) > 1e-6
     if not np.any(valid_4d_mask):
         return {"Error": "Triangulation resulted in invalid homogeneous coordinates (all W near zero)."}
 
     points_4d_hom_valid = points_4d_hom[:, valid_4d_mask]
-    # Keep track of corresponding 2D points
     pts1_valid_4d = pts1[valid_4d_mask]
 
     points_3d = points_4d_hom_valid[:3] / points_4d_hom_valid[3]
     points_3d = points_3d.T
 
-    # Filter points
     points_3d_cam1 = points_3d
     points_3d_cam2 = (R @ points_3d.T + T).T
-    filter_z_max = 1000.0  # Adjust based on expected scene scale
+    filter_z_max = 1000.0
     valid_mask = (points_3d_cam1[:, 2] > 0) & (points_3d_cam2[:, 2] > 0) & (points_3d_cam1[:, 2] < filter_z_max) & \
                  (pts1_valid_4d[:, 0] >= 0) & (pts1_valid_4d[:, 0] < img_width) & \
                  (pts1_valid_4d[:, 1] >= 0) & (
                      pts1_valid_4d[:, 1] < img_height)
 
     points_3d_filtered = points_3d[valid_mask]
-    pts1_filtered = pts1_valid_4d[valid_mask]  # Filter corresponding 2D points
+    pts1_filtered = pts1_valid_4d[valid_mask]
 
     num_3d_points = len(points_3d_filtered)
     print(
@@ -922,10 +1009,11 @@ def xfeat_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVe
     if num_3d_points == 0:
         return {"Error": "No valid 3D points generated after filtering."}
 
-    # Extract colors
     print("Extracting colors for 3D points...")
     colors_bgr = []
     for pt in pts1_filtered:
+        if cancel_event and cancel_event.is_set():
+            return {"Error": "Task canceled by user."}
         x, y = np.clip(np.int32(np.round(pt)), [0, 0], [
                        img_width - 1, img_height - 1])
         colors_bgr.append(imgL_color[y, x])
@@ -946,6 +1034,10 @@ def xfeat_reconstruction(pts1, pts2, cameraMatrix, rotationMatrix, translationVe
         print("Warning: Color array size mismatch persists. Point cloud will be uncolored.")
 
     print("Attempting to display point cloud in Open3D window...")
+    
+    if cancel_event and cancel_event.is_set():
+        return {"Error": "Task canceled by user."}
+    
     vis_error = None
     try:
         o3d.visualization.draw_geometries(
