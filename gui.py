@@ -34,16 +34,12 @@ class RedirectText:
         sys.stdout = self
 
     def stop_redirect(self):
-        # Ensure sys.stdout is restored only if it's the current redirector instance
         if isinstance(sys.stdout, RedirectText) and sys.stdout is self:
             if self.stdout_orig:
                 sys.stdout = self.stdout_orig
 
     def get_output(self):
         return self.output.getvalue()
-
-# Main GUI class
-
 
 class NotebookGUI:
     def __init__(self, root):
@@ -65,7 +61,6 @@ class NotebookGUI:
             (0, 0), window=self.scrollable_frame, anchor="nw")
         self.scrollable_frame.bind("<Configure>", self._on_frame_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        # Bind mouse wheel events more specifically to the canvas and its children
         self.canvas.bind("<Enter>", self._bind_mousewheel)
         self.canvas.bind("<Leave>", self._unbind_mousewheel)
 
@@ -74,17 +69,19 @@ class NotebookGUI:
         self.notebook.pack(pady=10, padx=10, expand=True, fill="both")
 
         # --- State & Image Refs ---
-        self.stereo_calib_results = None  # Stores results from stereo calibration
+        self.stereo_calib_results = None
         self.stereo_rect_results = None
         self.feat_detect_match_results = None
         self.stereo_geometry_results = None
         self.triangulation_results = None
         self.disparity_calculation_results = None
-        self.image_references = {}  # Stores {widget: ImageTk.PhotoImage}
+        self.image_references = {}
 
         # --- Loading Indicator State ---
         self.loading_window = None
         self.task_queue = queue.Queue()
+        self.current_thread = None
+        self.cancel_event = threading.Event()
 
         # --- Create Tabs ---
         self.create_stereo_calib_tab()
@@ -104,12 +101,9 @@ class NotebookGUI:
         canvas_width = event.width
         self.canvas.itemconfig(self.canvas_window, width=canvas_width)
 
-    # --- Mouse Wheel Binding/Unbinding for Scrolling ---
     def _bind_mousewheel(self, event):
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self.canvas.bind_all(
-            "<Button-4>", self._on_mousewheel)  # Linux scroll up
-        # Linux scroll down
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
         self.canvas.bind_all("<Button-5>", self._on_mousewheel)
 
     def _unbind_mousewheel(self, event):
@@ -118,10 +112,9 @@ class NotebookGUI:
         self.canvas.unbind_all("<Button-5>")
 
     def _on_mousewheel(self, event):
-        # Determine the scroll direction and amount
-        if event.num == 4 or event.delta > 0:  # Linux scroll up or Windows/macOS scroll up
+        if event.num == 4 or event.delta > 0:
             self.canvas.yview_scroll(-1, "units")
-        elif event.num == 5 or event.delta < 0:  # Linux scroll down or Windows/macOS scroll down
+        elif event.num == 5 or event.delta < 0:
             self.canvas.yview_scroll(1, "units")
 
     # --- Loading Indicator Methods ---
@@ -133,16 +126,15 @@ class NotebookGUI:
         self.loading_window.title("Working")
         self.loading_window.resizable(False, False)
         self.loading_window.grab_set()
-        self.loading_window.protocol(
-            "WM_DELETE_WINDOW", lambda: None)  # Prevent closing
+        # Allow closing to cancel task
+        self.loading_window.protocol("WM_DELETE_WINDOW", self._cancel_task)
         ttk.Label(self.loading_window, text=message, font=(
             "Helvetica", 12)).pack(pady=10, padx=20)
         pb = ttk.Progressbar(
             self.loading_window, orient='horizontal', mode='indeterminate', length=200)
         pb.pack(pady=(0, 15), padx=20, fill='x', expand=True)
         pb.start(15)
-        # Center the loading window
-        self.loading_window.update_idletasks()  # Ensure window size is calculated
+        self.loading_window.update_idletasks()
         root_x, root_y = self.root.winfo_x(), self.root.winfo_y()
         root_w, root_h = self.root.winfo_width(), self.root.winfo_height()
         load_w, load_h = self.loading_window.winfo_width(), self.loading_window.winfo_height()
@@ -157,67 +149,81 @@ class NotebookGUI:
             self.loading_window.destroy()
             self.loading_window = None
 
+    def _cancel_task(self):
+        if self.current_thread is not None and self.current_thread.is_alive():
+            self.cancel_event.set()  # Signal cancellation
+            print("Cancellation requested for current task.")
+            self.task_queue.put(("CANCELLED", "Task cancelled by user."))
+            self._hide_loading()
+        else:
+            self._hide_loading()
+
     # --- Threading and Queue Handling ---
     def _run_task_with_loading(self, task_func, args=(), kwargs={}, loading_msg="Processing...", result_handler=None):
-        # Clear queue before starting a new task to prevent handling old results
         while not self.task_queue.empty():
             try:
                 self.task_queue.get_nowait()
             except queue.Empty:
                 break
+        self.cancel_event.clear()  # Reset cancellation flag
         self._show_loading(loading_msg)
 
         def worker():
             try:
+                # Pass cancel_event to backend functions
+                kwargs['cancel_event'] = self.cancel_event
                 result = task_func(*args, **kwargs)
-                self.task_queue.put(("SUCCESS", result))
+                if not self.cancel_event.is_set():
+                    self.task_queue.put(("SUCCESS", result))
+                else:
+                    self.task_queue.put(("CANCELLED", "Task cancelled by user."))
             except Exception as e:
-                import traceback
-                err_msg = f"Error in task: {e}\n{traceback.format_exc()}"
-                print(f"Error in worker thread: {e}")  # Print error to console
-                self.task_queue.put(("ERROR", err_msg))
+                if self.cancel_event.is_set():
+                    self.task_queue.put(("CANCELLED", "Task cancelled by user."))
+                else:
+                    import traceback
+                    err_msg = f"Error in task: {e}\n{traceback.format_exc()}"
+                    print(f"Error in worker thread: {e}")
+                    self.task_queue.put(("ERROR", err_msg))
         
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        # Start checking the queue
+        self.current_thread = threading.Thread(target=worker, daemon=True)
+        self.current_thread.start()
         self.root.after(100, self._check_queue, result_handler)
 
     def _check_queue(self, result_handler):
         try:
             status, result = self.task_queue.get_nowait()
-            # If we got a result, hide loading and process it
             self._hide_loading()
+            self.current_thread = None
             if status == "SUCCESS":
                 if result_handler:
                     try:
                         result_handler(result)
                     except Exception as e:
-                        # Print handler error to console
                         print(f"Error in result handler: {e}")
                         import traceback
                         traceback.print_exc()
                         messagebox.showerror(
                             "GUI Error", f"Error processing result:\n{e}")
-                # No automatic success message box if a handler was provided
             elif status == "ERROR":
-                print(f"Task failed:\n{result}")  # Print task error to console
+                print(f"Task failed:\n{result}")
                 short_error = str(result).split('\n')[0]
                 messagebox.showerror(
                     "Task Error", f"Operation failed:\n{short_error}\n\n(See console log for details)")
+            elif status == "CANCELLED":
+                print("Task was cancelled.")
+                messagebox.showinfo("Cancelled", result)
         
         except queue.Empty:
-            # If the queue is empty, check if the loading window still exists
-            # If it does, schedule another check
             if self.loading_window and self.loading_window.winfo_exists():
                 self.root.after(100, self._check_queue, result_handler)
-            # If loading window is gone (or never existed), stop checking
         
         except Exception as e:
-            # Print GUI error to console
             print(f"Error checking queue or handling result: {e}")
             import traceback
             traceback.print_exc()
-            self._hide_loading()  # Ensure loading is hidden on unexpected error
+            self._hide_loading()
+            self.current_thread = None
             messagebox.showerror(
                 "GUI Error", f"Error checking task status:\n{e}")
 
@@ -235,10 +241,10 @@ class NotebookGUI:
 
     def on_closing(self):
         print("Closing application...")
+        self.cancel_event.set()  # Signal cancellation of any running task
         self._hide_loading()
         self._clear_image_references()
         
-        # Stop all redirectors safely
         for attr_name in dir(self):
             if attr_name.startswith('redirector_'):
                 redirector = getattr(self, attr_name, None)
@@ -248,12 +254,10 @@ class NotebookGUI:
                     except Exception as e:
                         print(f"Error stopping redirector {attr_name}: {e}")
         
-        # Explicitly unbind mouse wheel to prevent errors after destroy
         self._unbind_mousewheel(None)
         self.root.destroy()
 
     def _display_image(self, label_widget, cv_image_pre_resized):
-        """Displays a pre-resized OpenCV image in a Tkinter Label."""
         if not label_widget or not label_widget.winfo_exists():
             self.image_references.pop(label_widget, None)
             return
@@ -270,9 +274,8 @@ class NotebookGUI:
         
         try:
             img_pil = None
-            if len(img_display.shape) == 2:  # Grayscale
+            if len(img_display.shape) == 2:
                 img_pil = Image.fromarray(img_display)
-            # Color BGR
             elif len(img_display.shape) == 3 and img_display.shape[2] == 3:
                 img_rgb = cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB)
                 img_pil = Image.fromarray(img_rgb)
@@ -549,7 +552,6 @@ class NotebookGUI:
         self.redirector_disp = RedirectText(self.disparity_output_text)
 
     # --- Action Methods ---
-    # 1. Stereo Calibration
     def run_stereo_calib_threaded(self):
         folder_path = self.stereo_calib_path_entry.get()
         self.stereo_calib_output_text.delete(1.0, tk.END)
@@ -569,7 +571,6 @@ class NotebookGUI:
             result_handler=self._handle_stereo_calib_result
         )
 
-    # 1. Handler
     def _handle_stereo_calib_result(self, results):
         if isinstance(results, str):
             print(f"Error: {results}")
@@ -623,7 +624,6 @@ class NotebookGUI:
                 "Error", "Stereo Calibration returned unexpected data.")
             self.stereo_calib_results = None
 
-    # 2. Stereo Rectification
     def run_stereo_rect_threaded(self):
         folder_path = self.stereo_rect_path_entry.get()
         
@@ -646,7 +646,7 @@ class NotebookGUI:
         R = self.stereo_calib_results.get("R")
         T = self.stereo_calib_results.get("T")
         image_size = self.stereo_calib_results.get("image_size")
-        F = self.stereo_calib_results.get("F")  # Get F for epiline drawing
+        F = self.stereo_calib_results.get("F")
         missing_calib = [k for k, v in {"M1": M1, "d1": d1, "M2": M2, "d2": d2,
                                         "R": R, "T": T, "F": F, "image_size": image_size}.items() if v is None]
         if missing_calib:
@@ -661,11 +661,10 @@ class NotebookGUI:
         self._run_task_with_loading(
             task_func=backend.stereo_rect,
             kwargs={'stereo_path': folder_path, 'M1': M1, 'd1': d1, 'M2': M2, 'd2': d2,
-                    'R': R, 'T': T, 'F': F, 'image_size': image_size},  # Pass F too
+                    'R': R, 'T': T, 'F': F, 'image_size': image_size},
             loading_msg="Running Rectification...", result_handler=self._handle_stereo_rect_result
         )
 
-    # 2. Handler
     def _handle_stereo_rect_result(self, results):
         if isinstance(results, str):
             print(f"Error: {results}")
@@ -705,7 +704,6 @@ class NotebookGUI:
                 "Error", "Rectification returned unexpected data.")
             self.stereo_rect_results = None
 
-    # 3. Feature Detection and Matching
     def run_feat_detect_match_threaded(self):
         folder_path = self.feat_detect_match_path_entry.get()
         self.feat_detect_match_output_text.delete(1.0, tk.END)
@@ -733,7 +731,6 @@ class NotebookGUI:
         self._run_task_with_loading(task_func=backend.feat_detect_match, kwargs={
                                     'stereo_path': folder_path, 'cameraMatrix1': M1}, loading_msg="Running Detection & Matching...", result_handler=self._handle_feat_detect_match_result)
 
-    # 3. Handler
     def _handle_feat_detect_match_result(self, results):
         if isinstance(results, str):
             print(f"Error: {results}")
@@ -786,7 +783,6 @@ class NotebookGUI:
             messagebox.showerror("Error", "Matching returned unexpected data.")
             self.feat_detect_match_results = None
 
-    # 4. Stereo Geometry Estimation
     def run_stereo_geometry_estimation_threaded(self):
         folder_path = self.stereo_geometry_estimation_path_entry.get()
         self.stereo_geometry_output_text.delete(1.0, tk.END)
@@ -812,7 +808,6 @@ class NotebookGUI:
         self._run_task_with_loading(task_func=backend.stereo_geometry_estimation, kwargs={
                                     'stereo_path': folder_path, 'cameraMatrix1': M1}, loading_msg="Estimating Geometry...", result_handler=self._handle_stereo_geometry_result)
 
-    # 4. Handler
     def _handle_stereo_geometry_result(self, results):
         if isinstance(results, str):
             print(f"Error: {results}")
@@ -876,7 +871,6 @@ class NotebookGUI:
                 "Error", "Geometry estimation returned unexpected data.")
             self.stereo_geometry_results = None
 
-    # 5. Triangulation
     def run_triangulation_and_reconstruction_threaded(self):
         self.triangulation_output_text.delete(1.0, tk.END)
         
@@ -916,7 +910,6 @@ class NotebookGUI:
         self._run_task_with_loading(task_func=backend.triangulation_and_3D_reconstruction, args=(pts1, pts2, camera_matrix, rotation_matrix,
                                     translation_vector, imgL_color), loading_msg="Triangulating & Visualizing...", result_handler=self._handle_triangulation_result)
 
-    # 5. Handler
     def _handle_triangulation_result(self, results):
         if isinstance(results, dict) and "Error" in results:
             print(f"Error: {results['Error']}")
@@ -950,7 +943,6 @@ class NotebookGUI:
             messagebox.showerror("Error", "Unknown triangulation result.")
             self.triangulation_results = None
 
-    # 6a. Disparity Calculation (Dense)
     def run_disparity_calculation_threaded(self):
         self.disparity_output_text.delete(1.0, tk.END)
         self._display_image(self.disparity_img_label, None)
@@ -981,7 +973,6 @@ class NotebookGUI:
         self._run_task_with_loading(task_func=backend.disparity_calculation, args=(imgL_for_disp, imgR_for_disp), kwargs={
                                     'guide_image': guide_image}, loading_msg="Calculating Disparity...", result_handler=self._handle_disparity_result)
 
-    # 6a. Handler
     def _handle_disparity_result(self, results):
         if isinstance(results, dict) and "Error" in results:
             error_msg = results['Error']
@@ -1015,7 +1006,6 @@ class NotebookGUI:
                 "Error", "Unknown result from disparity calculation.")
             self.disparity_calculation_results = None
 
-    # 6b. Visualize 3D Point Cloud (Dense)
     def run_visualize_3d_threaded(self):
         self.disparity_output_text.delete(1.0, tk.END)
         if not self.disparity_calculation_results:
@@ -1048,7 +1038,6 @@ class NotebookGUI:
         self._run_task_with_loading(task_func=backend.visualize_point_cloud_disparity, args=(
             raw_disparity_map, Q, colors), loading_msg="Generating & Visualizing 3D Cloud...", result_handler=self._handle_visualize_3d_result)
 
-    # 6b. Handler
     def _handle_visualize_3d_result(self, error_message):
         if error_message:
             print(f"Error: {error_message}")
@@ -1062,7 +1051,6 @@ class NotebookGUI:
                 tk.END, "SUCCESS: Point cloud display attempted.\n")
             self.disparity_output_text.see(tk.END)
 
-    # --- Browse Methods ---
     def _set_path_entry(self, entry_widget, folder_path): entry_widget.delete(
         0, tk.END); entry_widget.insert(0, folder_path)
 
@@ -1103,8 +1091,6 @@ class NotebookGUI:
             self._set_path_entry(
                 self.stereo_geometry_estimation_path_entry, folder)
 
-
-# Run the application
 if __name__ == "__main__":
     root = tk.Tk()
     app = NotebookGUI(root)
